@@ -31,11 +31,11 @@ jobs:
           cp custom/usermod_passthrough.cpp \
              WLED/usermods/usermod_passthrough/usermod_passthrough.cpp
 
-      - name: Enable custom usermod
+      - name: Create PlatformIO override
         run: |
           cat > WLED/platformio_override.ini <<'EOF'
 
-          [env:esp32dev]
+          [env:esp32dev_passthrough]
           extends = env:esp32dev
 
           custom_usermods =
@@ -46,10 +46,11 @@ jobs:
 
       - name: Verify custom usermod
         run: |
-          echo "===== Usermod files ====="
+          echo "===== USERMOD FILES ====="
           ls -la WLED/usermods/usermod_passthrough/
 
-          echo "===== PlatformIO override ====="
+          echo ""
+          echo "===== PLATFORMIO OVERRIDE ====="
           cat WLED/platformio_override.ini
 
       - name: Install PlatformIO
@@ -59,10 +60,10 @@ jobs:
       - name: Build WLED
         working-directory: WLED
         run: |
-          pio run -e esp32dev
+          pio run -e esp32dev_passthrough
 
       - name: Upload firmware
         uses: actions/upload-artifact@v5
         with:
           name: wled-custom-firmware
-          path: WLED/.pio/build/esp32dev/*.bin
+          path: WLED/.pio/build/esp32dev_passthrough/*.bin
