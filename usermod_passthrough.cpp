@@ -6,17 +6,9 @@
 #define MAX_LEDS 300
 
 class PassthroughUsermod : public Usermod {
-void setup() override {
-  pinMode(PASSTHROUGH_IN_PIN, INPUT);
 
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("Passthrough Usermod STARTED");
-  Serial.print("Input GPIO: ");
-  Serial.println(PASSTHROUGH_IN_PIN);
-  Serial.println("================================");
-}
 private:
+
   rmt_channel_handle_t rxChannel = nullptr;
   rmt_symbol_word_t *rxBuffer = nullptr;
 
@@ -112,33 +104,55 @@ public:
 
   void setup() override {
 
+    // GPIO25 input
+    pinMode(PASSTHROUGH_INPUT_PIN, INPUT);
+
+    // Diagnostic message
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("Passthrough Usermod STARTED");
+    Serial.print("Input GPIO: ");
+    Serial.println(PASSTHROUGH_INPUT_PIN);
+    Serial.println("================================");
+
+    // Allocate RMT receive buffer
     rxBuffer = (rmt_symbol_word_t *)heap_caps_malloc(
         MAX_SYMBOLS * sizeof(rmt_symbol_word_t),
         MALLOC_CAP_INTERNAL
     );
 
     if (!rxBuffer) {
-      DEBUG_PRINTLN(F("Passthrough: RX buffer allocation failed"));
+      DEBUG_PRINTLN(
+          F("Passthrough: RX buffer allocation failed")
+      );
       return;
     }
 
+    // RMT configuration
     rmt_rx_channel_config_t rxConfig = {};
 
     rxConfig.gpio_num =
         (gpio_num_t)PASSTHROUGH_INPUT_PIN;
 
-    rxConfig.clk_src = RMT_CLK_SRC_DEFAULT;
+    rxConfig.clk_src =
+        RMT_CLK_SRC_DEFAULT;
 
-    rxConfig.resolution_hz = 10000000;
+    rxConfig.resolution_hz =
+        10000000;
 
-    rxConfig.mem_block_symbols = 64;
+    rxConfig.mem_block_symbols =
+        64;
 
-    rxConfig.intr_priority = 1;
+    rxConfig.intr_priority =
+        1;
 
-    rxConfig.flags.invert_in = false;
+    rxConfig.flags.invert_in =
+        false;
 
-    rxConfig.flags.with_dma = false;
+    rxConfig.flags.with_dma =
+        false;
 
+    // Create RMT RX channel
     esp_err_t err =
         rmt_new_rx_channel(
             &rxConfig,
@@ -146,12 +160,15 @@ public:
         );
 
     if (err != ESP_OK) {
+
       DEBUG_PRINTLN(
           F("Passthrough: RMT channel creation failed")
       );
+
       return;
     }
 
+    // Register callback
     rmt_rx_event_callbacks_t callbacks = {};
 
     callbacks.on_recv_done =
@@ -165,27 +182,37 @@ public:
         );
 
     if (err != ESP_OK) {
+
       DEBUG_PRINTLN(
           F("Passthrough: callback registration failed")
       );
+
       return;
     }
 
-    err = rmt_enable(rxChannel);
+    // Enable RMT
+    err =
+        rmt_enable(rxChannel);
 
     if (err != ESP_OK) {
+
       DEBUG_PRINTLN(
           F("Passthrough: RMT enable failed")
       );
+
       return;
     }
 
+    // Receive configuration
     rmt_receive_config_t receiveConfig = {};
 
-    receiveConfig.signal_range_min_ns = 100;
+    receiveConfig.signal_range_min_ns =
+        100;
 
-    receiveConfig.signal_range_max_ns = 100000;
+    receiveConfig.signal_range_max_ns =
+        100000;
 
+    // Start receiving
     err =
         rmt_receive(
             rxChannel,
@@ -196,9 +223,11 @@ public:
         );
 
     if (err != ESP_OK) {
+
       DEBUG_PRINTLN(
           F("Passthrough: receive start failed")
       );
+
       return;
     }
 
