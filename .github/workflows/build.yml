@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: wled/WLED
-          ref: v0.16.0
+          ref: 0.16.0
           path: WLED
 
       - name: Checkout custom usermod
@@ -31,7 +31,6 @@ jobs:
           cat > WLED/platformio_override.ini <<'EOF'
           [env:esp32dev]
           extends = env:esp32dev
-
           custom_usermods =
             ${env:esp32dev.custom_usermods}
             usermod_passthrough
@@ -39,10 +38,6 @@ jobs:
 
       - name: Install PlatformIO
         run: pip install platformio
-
-      - name: Clean previous build
-        working-directory: WLED
-        run: pio run -e esp32dev -t clean
 
       - name: Build WLED
         working-directory: WLED
