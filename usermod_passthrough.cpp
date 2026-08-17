@@ -6,6 +6,16 @@
 #define MAX_LEDS 300
 
 class PassthroughUsermod : public Usermod {
+void setup() override {
+  pinMode(PASSTHROUGH_IN_PIN, INPUT);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("Passthrough Usermod STARTED");
+  Serial.print("Input GPIO: ");
+  Serial.println(PASSTHROUGH_IN_PIN);
+  Serial.println("================================");
+}
 private:
   rmt_channel_handle_t rxChannel = nullptr;
   rmt_symbol_word_t *rxBuffer = nullptr;
