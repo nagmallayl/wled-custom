@@ -1,0 +1,39 @@
+name: Build WLED Custom
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout WLED
+        uses: actions/checkout@v5
+        with:
+          repository: wled/WLED
+          ref: v0.16.0
+          path: WLED
+
+      - name: Checkout custom usermod
+        uses: actions/checkout@v5
+        with:
+          path: custom
+
+      - name: Install custom usermod
+        run: |
+          cp custom/library.json WLED/usermods/
+          cp custom/usermod_passthrough.cpp WLED/usermods/
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build WLED
+        working-directory: WLED
+        run: pio run -e esp32dev
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v5
+        with:
+          name: wled-custom-firmware
+          path: WLED/.pio/build/esp32dev/*.bin
