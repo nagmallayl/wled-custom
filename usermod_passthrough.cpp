@@ -32,7 +32,8 @@ private:
       const rmt_symbol_word_t *symbols,
       size_t count) {
 
-    if (count < 24) return;
+    if (count < 24)
+      return;
 
     uint8_t bytes[MAX_LEDS * 3];
     uint16_t byteCount = 0;
@@ -79,7 +80,7 @@ private:
       ledCount = strip.getLength();
 
     /*
-     * Incoming order:
+     * Incoming:
      *
      * GRB
      *
@@ -104,10 +105,14 @@ public:
 
   void setup() override {
 
-    // GPIO25 input
+    /*
+     * GPIO25 input
+     */
     pinMode(PASSTHROUGH_INPUT_PIN, INPUT);
 
-    // Diagnostic message
+    /*
+     * Diagnostic message
+     */
     Serial.println();
     Serial.println("================================");
     Serial.println("Passthrough Usermod STARTED");
@@ -115,20 +120,28 @@ public:
     Serial.println(PASSTHROUGH_INPUT_PIN);
     Serial.println("================================");
 
-    // Allocate RMT receive buffer
-    rxBuffer = (rmt_symbol_word_t *)heap_caps_malloc(
-        MAX_SYMBOLS * sizeof(rmt_symbol_word_t),
-        MALLOC_CAP_INTERNAL
-    );
+    /*
+     * Allocate RMT receive buffer
+     */
+    rxBuffer =
+        (rmt_symbol_word_t *)heap_caps_malloc(
+            MAX_SYMBOLS *
+                sizeof(rmt_symbol_word_t),
+            MALLOC_CAP_INTERNAL
+        );
 
     if (!rxBuffer) {
+
       DEBUG_PRINTLN(
           F("Passthrough: RX buffer allocation failed")
       );
+
       return;
     }
 
-    // RMT configuration
+    /*
+     * RMT RX configuration
+     */
     rmt_rx_channel_config_t rxConfig = {};
 
     rxConfig.gpio_num =
@@ -152,7 +165,9 @@ public:
     rxConfig.flags.with_dma =
         false;
 
-    // Create RMT RX channel
+    /*
+     * Create RMT RX channel
+     */
     esp_err_t err =
         rmt_new_rx_channel(
             &rxConfig,
@@ -168,7 +183,9 @@ public:
       return;
     }
 
-    // Register callback
+    /*
+     * Register callback
+     */
     rmt_rx_event_callbacks_t callbacks = {};
 
     callbacks.on_recv_done =
@@ -190,7 +207,9 @@ public:
       return;
     }
 
-    // Enable RMT
+    /*
+     * Enable RMT
+     */
     err =
         rmt_enable(rxChannel);
 
@@ -203,7 +222,9 @@ public:
       return;
     }
 
-    // Receive configuration
+    /*
+     * Receive configuration
+     */
     rmt_receive_config_t receiveConfig = {};
 
     receiveConfig.signal_range_min_ns =
@@ -212,7 +233,9 @@ public:
     receiveConfig.signal_range_max_ns =
         100000;
 
-    // Start receiving
+    /*
+     * Start receiving
+     */
     err =
         rmt_receive(
             rxChannel,
@@ -237,13 +260,17 @@ public:
   }
 
   void loop() override {
-    // Reception handled by RMT callback.
+    /*
+     * Reception handled by RMT callback.
+     */
   }
 
   void addToJsonInfo(JsonObject &root) override {
 
     JsonObject info =
-        root["u"].createNestedObject("Passthrough");
+        root["u"].createNestedObject(
+            "Passthrough"
+        );
 
     info["input"] =
         PASSTHROUGH_INPUT_PIN;
