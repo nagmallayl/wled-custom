@@ -1,7 +1,7 @@
 #include "wled.h"
 #include "driver/rmt_rx.h"
 
-#define PASSTHROUGH_INPUT_PIN 15
+#define PASSTHROUGH_INPUT_PIN 25
 #define MAX_SYMBOLS 4096
 #define MAX_LEDS 300
 
