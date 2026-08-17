@@ -1,0 +1,8 @@
+{
+  "name": "wled-passthrough",
+  "version": "1.0.0",
+  "description": "WS2811 input passthrough for WLED",
+  "build": {
+    "libArchive": false
+  }
+}
