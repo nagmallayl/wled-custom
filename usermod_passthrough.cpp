@@ -8,6 +8,8 @@
 #define INPUT_GPIO 25
 #define RX_CHANNEL RMT_CHANNEL_6
 
+// ESP32: 80 MHz / 2 = 40 MHz
+// 1 tick = 25 ns
 #define RMT_CLK_DIV 2
 
 // ======================================================
@@ -18,32 +20,48 @@
 #define WS2811_ICS    5
 
 #define FRAME_BYTES   (WS2811_ICS * 3)
-#define FRAME_BITS    (FRAME_BYTES * 8)
+#define FRAME_BITS    (FRAME_BYTES * 8)   // 120
 
 // ======================================================
-// MEASURED TIMING
+// MEASURED WS2811 TIMING
 // ======================================================
 //
-// 0:
-// H ≈ 14~15
+// bit 0:
+// HIGH ≈ 14~15 ticks
 //
-// 1:
-// H ≈ 50~51
+// bit 1:
+// HIGH ≈ 50~51 ticks
 //
 #define BIT_THRESHOLD 30
+
+// ======================================================
+// FRAME RESET / SYNC
+// ======================================================
+//
+// Old value:
+// 3000 ticks = 75 us
+//
+// New value:
+// 1000 ticks = 25 us
+//
+// Normal data LOW previously measured as high as ~84
+// ticks only (~2.1 us), so 1000 still leaves a very
+// large margin.
+//
+// The purpose is for RMT RX itself to terminate at the
+// WS2811 reset gap and give us a naturally synchronized
+// frame packet.
+//
+#define RMT_IDLE_TICKS 1000
 
 // ======================================================
 // REALTIME
 // ======================================================
 
-#define REALTIME_LOCK_MS  1000
-#define SIGNAL_TIMEOUT_MS 1500
+#define REALTIME_LOCK_MS   1000
+#define SIGNAL_TIMEOUT_MS  1500
 
-// ======================================================
-// DIAGNOSTIC
-// ======================================================
-
-// Print one decoded frame approximately once per second.
+// Diagnostic print interval
 #define FRAME_DEBUG_INTERVAL_MS 1000
 
 
@@ -55,53 +73,30 @@ private:
   bool rxReady = false;
 
   // ====================================================
-  // FRAME ASSEMBLER
+  // FRAME BUFFER
   // ====================================================
 
   uint8_t frameBuffer[FRAME_BYTES];
-
-  uint8_t currentByte = 0;
-  uint8_t bitCount    = 0;
-  uint8_t frameBytes  = 0;
-
-  uint16_t frameSymbols = 0;
-
-  // ====================================================
-  // STATE
-  // ====================================================
 
   bool realtimeActive = false;
 
   uint32_t lastFrameTime = 0;
 
   // ====================================================
-  // STATS
+  // STATISTICS
   // ====================================================
 
-  uint32_t chunksReceived = 0;
-  uint32_t framesReceived = 0;
-  uint32_t framesShown    = 0;
-  uint32_t resyncCount    = 0;
+  uint32_t packetsReceived = 0;
+  uint32_t goodFrames      = 0;
+  uint32_t shownFrames     = 0;
+  uint32_t shortPackets    = 0;
+  uint32_t longPackets     = 0;
+
+  uint16_t lastPacketSymbols = 0;
 
   uint32_t lastDebugTime = 0;
-
-  // ====================================================
-  // FRAME DATA DEBUG
-  // ====================================================
-
   uint32_t lastFrameDebugTime = 0;
 
-  // ====================================================
-  // RESET ASSEMBLER
-  // ====================================================
-
-  void resetAssembler()
-  {
-    currentByte  = 0;
-    bitCount     = 0;
-    frameBytes   = 0;
-    frameSymbols = 0;
-  }
 
   // ====================================================
   // REALTIME
@@ -117,8 +112,9 @@ private:
     realtimeActive = true;
   }
 
+
   // ====================================================
-  // PRINT DECODED FRAME
+  // PRINT FRAME DATA
   // ====================================================
 
   void printFrameDiagnostic()
@@ -128,8 +124,7 @@ private:
     if (
       now - lastFrameDebugTime <
       FRAME_DEBUG_INTERVAL_MS
-    )
-    {
+    ) {
       return;
     }
 
@@ -144,30 +139,20 @@ private:
       uint8_t i = 0;
       i < WS2811_ICS;
       i++
-    )
-    {
+    ) {
       uint8_t p = i * 3;
-
-      uint8_t g =
-        frameBuffer[p + 0];
-
-      uint8_t r =
-        frameBuffer[p + 1];
-
-      uint8_t b =
-        frameBuffer[p + 2];
 
       Serial.print("IC");
       Serial.print(i + 1);
 
       Serial.print(": G=");
-      Serial.print(g);
+      Serial.print(frameBuffer[p + 0]);
 
       Serial.print(" R=");
-      Serial.print(r);
+      Serial.print(frameBuffer[p + 1]);
 
       Serial.print(" B=");
-      Serial.println(b);
+      Serial.println(frameBuffer[p + 2]);
     }
 
     Serial.println(
@@ -175,32 +160,128 @@ private:
     );
   }
 
+
   // ====================================================
-  // SHOW COMPLETE FRAME
+  // DECODE SYNCHRONIZED PACKET
   // ====================================================
 
-  void showCompleteFrame()
+  bool decodePacket(
+    rmt_item32_t *items,
+    size_t count
+  )
   {
-    if (
-      frameBytes != FRAME_BYTES ||
-      bitCount != 0
-    )
+    if (!items)
+      return false;
+
+    packetsReceived++;
+    lastPacketSymbols = count;
+
+    /*
+     * Because the RMT hardware now terminates reception
+     * at the reset/idle gap, THIS packet should begin at
+     * the beginning of a new WS2811 frame.
+     *
+     * We therefore NEVER carry decoder state from one
+     * packet to the next.
+     */
+
+    if (count < FRAME_BITS)
     {
-      resetAssembler();
-      return;
+      shortPackets++;
+      return false;
     }
 
-    // --------------------------------------------------
-    // Diagnostic BEFORE changing/resetting the buffer
-    // --------------------------------------------------
+    /*
+     * More than 120 can happen if an end marker or extra
+     * RMT item is present. We only decode the first 120
+     * non-empty items.
+     */
 
-    printFrameDiagnostic();
+    if (count > FRAME_BITS + 8)
+    {
+      longPackets++;
+    }
 
+    memset(
+      frameBuffer,
+      0,
+      sizeof(frameBuffer)
+    );
+
+    uint16_t bitIndex = 0;
+
+    for (
+      size_t i = 0;
+      i < count && bitIndex < FRAME_BITS;
+      i++
+    )
+    {
+      // Ignore only completely empty RMT items.
+      if (
+        items[i].duration0 == 0 &&
+        items[i].duration1 == 0
+      ) {
+        continue;
+      }
+
+      /*
+       * Use the decoder that actually worked with your
+       * measured signal.
+       *
+       * duration0 < 30  -> 0
+       * duration0 >= 30 -> 1
+       */
+
+      bool bit =
+        items[i].duration0 >= BIT_THRESHOLD;
+
+      uint8_t byteIndex =
+        bitIndex >> 3;
+
+      uint8_t bitPosition =
+        7 - (bitIndex & 0x07);
+
+      if (bit)
+      {
+        frameBuffer[byteIndex] |=
+          (1U << bitPosition);
+      }
+
+      bitIndex++;
+    }
+
+    if (bitIndex != FRAME_BITS)
+    {
+      shortPackets++;
+      return false;
+    }
+
+    goodFrames++;
+
+    return true;
+  }
+
+
+  // ====================================================
+  // SHOW FRAME
+  // ====================================================
+
+  void showFrame()
+  {
     keepRealtimeActive();
 
     // ==================================================
-    // INPUT = GRB
-    // OUTPUT = BRG
+    // INPUT:
+    // G R B
+    //
+    // REQUIRED OUTPUT:
+    // B R G
+    //
+    // WLED API receives R,G,B parameters:
+    //
+    // output R = input B
+    // output G = input R
+    // output B = input G
     // ==================================================
 
     for (
@@ -220,146 +301,23 @@ private:
       uint8_t inputB =
         frameBuffer[p + 2];
 
-      // GRB -> BRG
-      uint8_t outputR = inputB;
-      uint8_t outputG = inputR;
-      uint8_t outputB = inputG;
-
       strip.setPixelColor(
         i,
-        outputR,
-        outputG,
-        outputB
+        inputB,  // R
+        inputR,  // G
+        inputG   // B
       );
     }
 
     strip.show();
 
-    framesShown++;
-    framesReceived++;
+    shownFrames++;
 
     lastFrameTime = millis();
 
-    resetAssembler();
+    printFrameDiagnostic();
   }
 
-  // ====================================================
-  // PROCESS ONE RMT SYMBOL
-  // ====================================================
-
-  void processSymbol(
-    const rmt_item32_t &item
-  )
-  {
-    if (
-      item.duration0 == 0 &&
-      item.duration1 == 0
-    )
-    {
-      return;
-    }
-
-    /*
-     * Keep the decoder that gave the best
-     * results in previous tests:
-     *
-     * duration0 < 30  = 0
-     * duration0 >= 30 = 1
-     */
-
-    bool bit =
-      item.duration0 >= BIT_THRESHOLD;
-
-    currentByte <<= 1;
-
-    if (bit)
-    {
-      currentByte |= 1;
-    }
-
-    bitCount++;
-    frameSymbols++;
-
-    // --------------------------------------------------
-    // BYTE COMPLETE
-    // --------------------------------------------------
-
-    if (bitCount == 8)
-    {
-      if (frameBytes < FRAME_BYTES)
-      {
-        frameBuffer[frameBytes] =
-          currentByte;
-
-        frameBytes++;
-      }
-
-      currentByte = 0;
-      bitCount = 0;
-    }
-
-    // --------------------------------------------------
-    // EXACT FRAME COMPLETE
-    // --------------------------------------------------
-
-    if (
-      frameSymbols == FRAME_BITS &&
-      frameBytes == FRAME_BYTES &&
-      bitCount == 0
-    )
-    {
-      showCompleteFrame();
-      return;
-    }
-
-    // --------------------------------------------------
-    // SAFETY
-    // --------------------------------------------------
-
-    if (frameSymbols > FRAME_BITS)
-    {
-      resyncCount++;
-
-      resetAssembler();
-    }
-  }
-
-  // ====================================================
-  // PROCESS RMT CHUNK
-  // ====================================================
-
-  void processChunk(
-    rmt_item32_t *items,
-    size_t count
-  )
-  {
-    if (!items)
-      return;
-
-    chunksReceived++;
-
-    /*
-     * Do NOT reset frame state when a RingBuffer
-     * packet ends.
-     *
-     * Example:
-     *
-     * chunk 1 = 40
-     * chunk 2 = 27
-     * chunk 3 = 53
-     *
-     * total = 120
-     */
-
-    for (
-      size_t i = 0;
-      i < count;
-      i++
-    )
-    {
-      processSymbol(items[i]);
-    }
-  }
 
   // ====================================================
   // RMT SETUP
@@ -381,6 +339,11 @@ private:
     config.clk_div =
       RMT_CLK_DIV;
 
+    /*
+     * 2 × 64 = 128 RMT items.
+     *
+     * Enough for our 120-bit frame.
+     */
     config.mem_block_num =
       2;
 
@@ -390,8 +353,16 @@ private:
     config.rx_config.filter_en =
       false;
 
+    /*
+     * CRITICAL CHANGE:
+     *
+     * 1000 instead of 3000.
+     *
+     * The hardware reset/idle boundary should now end
+     * each RX transaction before the next WS2811 frame.
+     */
     config.rx_config.idle_threshold =
-      3000;
+      RMT_IDLE_TICKS;
 
     esp_err_t err;
 
@@ -411,6 +382,7 @@ private:
       return false;
     }
 
+
     err =
       rmt_driver_install(
         RX_CHANNEL,
@@ -428,6 +400,7 @@ private:
 
       return false;
     }
+
 
     err =
       rmt_get_ringbuf_handle(
@@ -447,6 +420,7 @@ private:
       return false;
     }
 
+
     err =
       rmt_rx_start(
         RX_CHANNEL,
@@ -464,8 +438,10 @@ private:
       return false;
     }
 
+
     return true;
   }
+
 
 public:
 
@@ -517,11 +493,23 @@ public:
     );
 
     Serial.println(
-      "Chunk assembler: ENABLED"
+      "Frame sync: HARDWARE IDLE RESET"
+    );
+
+    Serial.print(
+      "RMT idle threshold: "
+    );
+
+    Serial.print(
+      RMT_IDLE_TICKS
     );
 
     Serial.println(
-      "Frame diagnostic: ENABLED"
+      " ticks"
+    );
+
+    Serial.println(
+      "RMT idle time: 25 us"
     );
 
     Serial.print(
@@ -569,7 +557,7 @@ public:
     );
 
     Serial.println(
-      "Effects: OFF in realtime"
+      "Effects: OFF during realtime"
     );
 
     Serial.println(
@@ -577,8 +565,13 @@ public:
     );
 
     Serial.println(
+      "Frame diagnostic: ENABLED"
+    );
+
+    Serial.println(
       "================================"
     );
+
 
     if (setupRX())
     {
@@ -597,18 +590,20 @@ public:
       return;
     }
 
+
     Serial.println(
       "Passthrough READY"
     );
 
     Serial.println(
-      "Waiting for WS2811 DATA..."
+      "Waiting for synchronized frames..."
     );
 
     Serial.println(
       "================================"
     );
   }
+
 
   // ====================================================
   // LOOP
@@ -624,11 +619,13 @@ public:
       return;
     }
 
+
     // =================================================
-    // RECEIVE ONE RMT CHUNK
+    // RECEIVE ONE RESET-SYNCHRONIZED PACKET
     // =================================================
 
     size_t receivedSize = 0;
+
 
     rmt_item32_t *items =
       (rmt_item32_t *)
@@ -638,16 +635,24 @@ public:
         0
       );
 
+
     if (items)
     {
       size_t count =
         receivedSize /
         sizeof(rmt_item32_t);
 
-      processChunk(
-        items,
-        count
-      );
+
+      if (
+        decodePacket(
+          items,
+          count
+        )
+      )
+      {
+        showFrame();
+      }
+
 
       vRingbufferReturnItem(
         rxRingBuffer,
@@ -655,8 +660,9 @@ public:
       );
     }
 
+
     // =================================================
-    // RETURN TO WLED EFFECTS
+    // RETURN TO NORMAL WLED
     // =================================================
 
     if (
@@ -669,12 +675,11 @@ public:
 
       realtimeActive = false;
 
-      resetAssembler();
-
       Serial.println(
         "Realtime OFF -> WLED effects"
       );
     }
+
 
     // =================================================
     // DEBUG
@@ -683,79 +688,72 @@ public:
     uint32_t now =
       millis();
 
+
     if (
       now - lastDebugTime >= 2000
     )
     {
       lastDebugTime = now;
 
+
       Serial.print(
-        "Chunks: "
+        "Packets: "
       );
 
       Serial.print(
-        chunksReceived
+        packetsReceived
+      );
+
+
+      Serial.print(
+        "  Good: "
       );
 
       Serial.print(
-        "  Frames: "
+        goodFrames
       );
 
-      Serial.print(
-        framesReceived
-      );
 
       Serial.print(
         "  Shown: "
       );
 
       Serial.print(
-        framesShown
+        shownFrames
       );
+
+
+      Serial.print(
+        "  Short: "
+      );
+
+      Serial.print(
+        shortPackets
+      );
+
+
+      Serial.print(
+        "  Long: "
+      );
+
+      Serial.print(
+        longPackets
+      );
+
 
       Serial.print(
         "  Symbols: "
       );
 
       Serial.print(
-        frameSymbols
+        lastPacketSymbols
       );
 
-      Serial.print(
-        "/"
-      );
-
-      Serial.print(
-        FRAME_BITS
-      );
-
-      Serial.print(
-        "  Bytes: "
-      );
-
-      Serial.print(
-        frameBytes
-      );
-
-      Serial.print(
-        "  Bits: "
-      );
-
-      Serial.print(
-        bitCount
-      );
-
-      Serial.print(
-        "  Resync: "
-      );
-
-      Serial.print(
-        resyncCount
-      );
 
       Serial.print(
         "  Mode: "
       );
+
 
       if (realtimeActive)
       {
@@ -771,6 +769,7 @@ public:
       }
     }
   }
+
 
   // ====================================================
   // INFO
@@ -795,6 +794,9 @@ public:
     info["rmt_channel"] =
       6;
 
+    info["idle_ticks"] =
+      RMT_IDLE_TICKS;
+
     info["physical_leds"] =
       PHYSICAL_LEDS;
 
@@ -810,18 +812,22 @@ public:
     info["output_order"] =
       "BRG";
 
-    info["chunks"] =
-      chunksReceived;
+    info["packets"] =
+      packetsReceived;
 
-    info["frames"] =
-      framesReceived;
+    info["good_frames"] =
+      goodFrames;
 
     info["shown"] =
-      framesShown;
+      shownFrames;
 
-    info["resync"] =
-      resyncCount;
+    info["short_packets"] =
+      shortPackets;
+
+    info["long_packets"] =
+      longPackets;
   }
+
 
   uint16_t getId() override
   {
