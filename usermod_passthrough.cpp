@@ -7,40 +7,40 @@
 
 #define PASSTHROUGH_INPUT_PIN 25
 
-// WLED output GPIO
-// WLED itself controls this pin.
-#define PASSTHROUGH_OUTPUT_PIN 16
+// لا نحدد GPIO للإخراج هنا.
+// WLED هو المسؤول عن GPIO الخاص بالشريط.
 
 // ======================================================
-// WS2811
+// WS2811 CONFIG
 // ======================================================
 
-// 60 physical LEDs
-// Each WS2811 IC controls 3 physical LEDs
-// 60 / 3 = 20 ICs
+// الشريط يحتوي 60 LED فعلي
+// كل WS2811 IC يتحكم في 3 LED
+// 60 / 3 = 20 IC
+
 #define PHYSICAL_LEDS 60
-#define PIXEL_COUNT   20
+#define WS2811_ICS    20
 
-// 3 bytes per WS2811 IC
-#define FRAME_BYTES   (PIXEL_COUNT * 3)
+// كل IC يستقبل 3 بايت
+#define FRAME_BYTES   (WS2811_ICS * 3)
 
-// WS2811 speed
-#define WS2811_KHZ 800
+// كل بايت = 8 bits
+// 20 IC × 24 bits = 480 symbols
+#define FRAME_BITS    (FRAME_BYTES * 8)
+
+// 800 kHz
+#define WS2811_KHZ    800
 
 // ======================================================
 // RMT
 // ======================================================
 
-// ESP32 classic RMT:
+// ESP32 classic
 // 80 MHz / 2 = 40 MHz
 // 1 tick = 25 ns
+
 #define RMT_CLK_DIV 2
 
-// 50 us
-// 50 us / 25 ns = 2000 ticks
-#define RMT_IDLE_THRESHOLD 2000
-
-// RX channel
 #define RX_CHANNEL RMT_CHANNEL_0
 
 // ======================================================
@@ -55,25 +55,24 @@ private:
 
   bool rxReady = false;
 
-  // ====================================================
-  // FRAME BUFFER
-  // ====================================================
+  // ----------------------------------------------------
+  // Incoming frame
+  // ----------------------------------------------------
 
   uint8_t frameBuffer[FRAME_BYTES];
 
   uint16_t frameBytes = 0;
-
   uint8_t currentByte = 0;
-
   uint8_t bitCount = 0;
 
-  // A complete frame is waiting for WLED
   volatile bool frameReady = false;
 
-  // Passthrough active
   bool passthroughActive = false;
 
+  // ----------------------------------------------------
   // Statistics
+  // ----------------------------------------------------
+
   uint32_t framesReceived = 0;
   uint32_t framesDropped = 0;
 
@@ -94,48 +93,38 @@ private:
 
 
   // ====================================================
-  // RESYNCHRONIZE
-  // ====================================================
-
-  void resynchronize()
-  {
-    resetDecoder();
-  }
-
-
-  // ====================================================
-  // DECODE ONE WS2811 BIT
+  // DECODE WS2811 BIT
   // ====================================================
 
   bool decodeBit(const rmt_item32_t &item)
   {
-    uint16_t high =
-        item.duration0;
+    uint16_t high = item.duration0;
+    uint16_t low  = item.duration1;
 
-    uint16_t low =
-        item.duration1;
-
-    uint16_t total =
-        high + low;
-
+    uint16_t total = high + low;
 
     /*
-     * 800 kHz WS2811:
+     * 800 kHz WS2811
+     *
+     * Total period ≈ 1.25 us
+     *
+     * With 40 MHz RMT:
+     *
+     * 1 tick = 25 ns
      *
      * Total ≈ 50 ticks
-     *
-     * 0:
-     * HIGH ≈ 16
-     * LOW  ≈ 34
-     *
-     * 1:
-     * HIGH ≈ 32
-     * LOW  ≈ 18
      */
 
     if (total < 35 || total > 65)
       return false;
 
+
+    /*
+     * WS2811:
+     *
+     * 0 = shorter HIGH
+     * 1 = longer HIGH
+     */
 
     return high > low;
   }
@@ -153,76 +142,50 @@ private:
       return;
 
 
-    for (size_t i = 0;
-         i < count;
-         i++) {
+    for (size_t i = 0; i < count; i++) {
 
-      uint16_t high =
-          items[i].duration0;
+      uint16_t high = items[i].duration0;
+      uint16_t low  = items[i].duration1;
 
-      uint16_t low =
-          items[i].duration1;
+      uint16_t total = high + low;
 
+
+      // ------------------------------------------------
+      // Empty symbol
+      // ------------------------------------------------
 
       if (high == 0 && low == 0)
         continue;
 
 
-      /*
-       * ------------------------------------------------
-       * WS2811 RESET / IDLE
-       * ------------------------------------------------
-       *
-       * With:
-       *
-       * 40 MHz RMT clock
-       * 1 tick = 25 ns
-       *
-       * 2000 ticks = 50 us
-       *
-       * A LOW period >= 50 us means:
-       *
-       * NEW FRAME
-       *
-       * This is also our resynchronization point.
-       */
+      // ------------------------------------------------
+      // If frame is already complete
+      //
+      // Ignore remaining symbols from this RX block.
+      // ------------------------------------------------
 
-      if (low >= RMT_IDLE_THRESHOLD) {
+      if (frameReady)
+        continue;
+
+
+      // ------------------------------------------------
+      // Invalid timing
+      // ------------------------------------------------
+
+      if (total < 35 || total > 65) {
 
         /*
-         * If we have exactly one complete frame,
-         * mark it ready.
+         * Bad timing.
+         *
+         * The important difference from the old version:
+         *
+         * We completely reset the decoder instead of
+         * continuing with a potentially incorrect bit
+         * alignment.
          */
 
-        if (
-            frameBytes == FRAME_BYTES &&
-            bitCount == 0
-        ) {
-
-          frameReady = true;
-
-          passthroughActive = true;
-
-          lastFrameTime = millis();
-
-          framesReceived++;
-
-        }
-        else if (frameBytes != 0) {
-
-          /*
-           * Incomplete / corrupted frame.
-           *
-           * Drop it and resynchronize.
-           */
-
+        if (frameBytes > 0 || bitCount > 0)
           framesDropped++;
-        }
-
-
-        /*
-         * Always start cleanly after RESET.
-         */
 
         resetDecoder();
 
@@ -230,57 +193,14 @@ private:
       }
 
 
-      /*
-       * ------------------------------------------------
-       * INVALID SYMBOL
-       * ------------------------------------------------
-       */
+      // ------------------------------------------------
+      // Decode bit
+      // ------------------------------------------------
 
-      uint16_t total =
-          high + low;
-
-
-      if (total < 35 || total > 65) {
-
-        /*
-         * A bad symbol can destroy bit alignment.
-         *
-         * Do NOT continue decoding from the
-         * middle of the corrupted frame.
-         */
-
-        resynchronize();
-
-        continue;
-      }
-
-
-      /*
-       * ------------------------------------------------
-       * PROTECT AGAINST EXTRA DATA
-       * ------------------------------------------------
-       */
-
-      if (frameBytes >= FRAME_BYTES) {
-
-        resynchronize();
-
-        continue;
-      }
-
-
-      /*
-       * ------------------------------------------------
-       * DECODE BIT
-       * ------------------------------------------------
-       */
-
-      bool bit =
-          decodeBit(items[i]);
+      bool bit = decodeBit(items[i]);
 
 
       currentByte <<= 1;
-
 
       if (bit)
         currentByte |= 1;
@@ -289,63 +209,80 @@ private:
       bitCount++;
 
 
-      /*
-       * ------------------------------------------------
-       * COMPLETE BYTE
-       * ------------------------------------------------
-       */
+      // ------------------------------------------------
+      // Complete byte
+      // ------------------------------------------------
 
       if (bitCount == 8) {
 
-        frameBuffer[frameBytes] =
-            currentByte;
+        if (frameBytes < FRAME_BYTES) {
 
-        frameBytes++;
+          frameBuffer[frameBytes] =
+              currentByte;
+
+          frameBytes++;
+        }
 
         currentByte = 0;
-
         bitCount = 0;
+      }
 
+
+      // ------------------------------------------------
+      // COMPLETE FRAME
+      // ------------------------------------------------
+
+      if (frameBytes == FRAME_BYTES &&
+          bitCount == 0) {
 
         /*
-         * We do NOT immediately output here.
+         * 20 IC × 24 bits
          *
-         * We wait for the WS2811 RESET/IDLE.
+         * = 480 bits
          *
-         * This prevents partially received frames
-         * from being displayed.
+         * = 60 bytes
          */
+
+        frameReady = true;
+
+        passthroughActive = true;
+
+        lastFrameTime = millis();
+
+        framesReceived++;
+
+        /*
+         * Do not reset here.
+         *
+         * We wait until applyFrameToWLED()
+         * consumes the frame.
+         */
+
+        break;
       }
     }
   }
 
 
   // ====================================================
-  // COLOR CONVERSION
+  // APPLY FRAME
   //
-  // INPUT:
+  // Incoming:
   //
-  //     G R B
+  //     GRB
   //
-  // REQUIRED OUTPUT:
+  // Required strip order:
   //
-  //     B R G
+  //     BRG
   //
-  // WLED buffer uses:
+  // WLED buffer itself is RGB.
   //
-  //     R G B
+  // Therefore:
   //
-  // Therefore the RGB values placed into WLED are:
+  // WLED R = incoming B
+  // WLED G = incoming R
+  // WLED B = incoming G
   //
-  //     R = input B
-  //     G = input R
-  //     B = input G
-  //
-  // This produces:
-  //
-  //     B R G
-  //
-  // when WLED outputs RGB.
   // ====================================================
 
   void applyFrameToWLED()
@@ -356,15 +293,15 @@ private:
 
     for (
         uint16_t i = 0;
-        i < PIXEL_COUNT;
+        i < WS2811_ICS;
         i++
     ) {
 
-      uint16_t p =
-          i * 3;
+      uint16_t p = i * 3;
 
 
       // Incoming GRB
+
       uint8_t inputG =
           frameBuffer[p + 0];
 
@@ -375,9 +312,9 @@ private:
           frameBuffer[p + 2];
 
 
-      // =================================================
-      // GRB -> BRG
-      // =================================================
+      // ------------------------------------------------
+      // GRB → BRG
+      // ------------------------------------------------
 
       uint8_t outputR =
           inputB;
@@ -389,12 +326,9 @@ private:
           inputG;
 
 
-      /*
-       * Put the converted RGB values
-       * into WLED's LED buffer.
-       *
-       * WLED performs the actual output.
-       */
+      // ------------------------------------------------
+      // Write to WLED buffer
+      // ------------------------------------------------
 
       strip.setPixelColor(
           i,
@@ -405,12 +339,18 @@ private:
     }
 
 
+    /*
+     * Frame consumed.
+     */
+
     frameReady = false;
+
+    resetDecoder();
   }
 
 
   // ====================================================
-  // RMT RX SETUP
+  // SETUP RMT RX
   // ====================================================
 
   bool setupRX()
@@ -436,7 +376,10 @@ private:
 
 
     /*
-     * Four RMT memory blocks.
+     * Four memory blocks.
+     *
+     * 256 RMT symbols internally.
+     * Data continues through the ring buffer.
      */
 
     config.mem_block_num = 4;
@@ -446,10 +389,9 @@ private:
 
 
     /*
-     * No filtering.
+     * No filter.
      *
-     * We want to preserve the original WS2811
-     * timing as much as possible.
+     * We want the original WS2811 timing.
      */
 
     config.rx_config.filter_en =
@@ -457,11 +399,17 @@ private:
 
 
     /*
-     * 50 us idle / reset.
+     * The receiver may terminate a chunk after
+     * a sufficiently long idle period.
+     *
+     * We no longer depend on this to detect
+     * the frame.
+     *
+     * Frame length itself determines completion.
      */
 
     config.rx_config.idle_threshold =
-        RMT_IDLE_THRESHOLD;
+        1000;
 
 
     esp_err_t result =
@@ -577,12 +525,8 @@ public:
     );
 
 
-    Serial.print(
-        "Output GPIO: "
-    );
-
     Serial.println(
-        PASSTHROUGH_OUTPUT_PIN
+        "Output GPIO: WLED"
     );
 
 
@@ -610,7 +554,7 @@ public:
     );
 
     Serial.println(
-        PIXEL_COUNT
+        WS2811_ICS
     );
 
 
@@ -620,6 +564,15 @@ public:
 
     Serial.println(
         FRAME_BYTES
+    );
+
+
+    Serial.print(
+        "Frame bits: "
+    );
+
+    Serial.println(
+        FRAME_BITS
     );
 
 
@@ -689,13 +642,6 @@ public:
 
   // ====================================================
   // WLED OVERLAY
-  //
-  // This runs before WLED sends the LEDs.
-  //
-  // We overwrite the LED buffer with the
-  // latest received frame.
-  //
-  // NO strip.show() here.
   // ====================================================
 
   void handleOverlayDraw() override
@@ -725,9 +671,10 @@ public:
 
 
     /*
-     * NON-BLOCKING RX
+     * NON-BLOCKING.
      *
-     * This is important for minimizing latency.
+     * This is important because we do not want
+     * the Usermod to hold WLED.
      */
 
     rmt_item32_t *items =
@@ -752,10 +699,6 @@ public:
       );
 
 
-      /*
-       * Release RMT memory immediately.
-       */
-
       vRingbufferReturnItem(
           rxRingBuffer,
           (void *)items
@@ -764,7 +707,7 @@ public:
 
 
     // =================================================
-    // AUTO PASSTHROUGH TIMEOUT
+    // SIGNAL TIMEOUT
     // =================================================
 
     if (passthroughActive) {
@@ -772,11 +715,6 @@ public:
       uint32_t now =
           millis();
 
-
-      /*
-       * If no frame arrived for 300 ms,
-       * return control to WLED.
-       */
 
       if (
           now - lastFrameTime >
@@ -836,6 +774,15 @@ public:
 
 
       Serial.print(
+          "    Bytes: "
+      );
+
+      Serial.print(
+          frameBytes
+      );
+
+
+      Serial.print(
           "    Mode: "
       );
 
@@ -857,7 +804,7 @@ public:
 
 
   // ====================================================
-  // WLED INFO
+  // INFO
   // ====================================================
 
   void addToJsonInfo(
@@ -876,7 +823,7 @@ public:
 
 
     info["output"] =
-        PASSTHROUGH_OUTPUT_PIN;
+        "WLED";
 
 
     info["physical_leds"] =
@@ -884,11 +831,15 @@ public:
 
 
     info["ws2811_ics"] =
-        PIXEL_COUNT;
+        WS2811_ICS;
 
 
     info["frame_bytes"] =
         FRAME_BYTES;
+
+
+    info["frame_bits"] =
+        FRAME_BITS;
 
 
     info["speed"] =
@@ -924,7 +875,7 @@ public:
 
 
 // ======================================================
-// REGISTER USERMOD
+// REGISTER
 // ======================================================
 
 static PassthroughUsermod passthroughUsermod;
