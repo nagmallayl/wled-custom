@@ -6,63 +6,56 @@
 // ======================================================
 
 #define INPUT_GPIO 25
-
-// RX channel kept away from low channels
 #define RX_CHANNEL RMT_CHANNEL_6
 
-// ESP32 classic
 // 80 MHz / 2 = 40 MHz
 #define RMT_CLK_DIV 2
 
-
 // ======================================================
-// WS2811
+// STRIP
 // ======================================================
 
-// Current short test strip:
-// 15 physical LEDs
-// 5 WS2811 ICs
+// 15 physical LEDs = 5 WS2811 ICs
 #define PHYSICAL_LEDS 15
 #define WS2811_ICS    5
 
 #define FRAME_BYTES   (WS2811_ICS * 3)
-#define FRAME_BITS    (FRAME_BYTES * 8)
-
+#define FRAME_BITS    (FRAME_BYTES * 8)   // 120 bits
 
 // ======================================================
-// MEASURED TIMING
+// REAL MEASURED SIGNAL
 // ======================================================
 //
-// Actual GPIO25 measurements:
+// 0: HIGH ~14-15 ticks
+// 1: HIGH ~50-51 ticks
 //
-// bit 0:
-// H = 14~15
-//
-// bit 1:
-// H = 50~51
-//
-// Therefore:
-//
-// H < 30  = 0
-// H >= 30 = 1
-//
-// This is the decoder that previously gave us
-// stable Frames > 1000.
-// ======================================================
-
 #define BIT_THRESHOLD 30
 
+// ======================================================
+// RMT FRAME SYNC
+// ======================================================
+//
+// 3000 ticks × 25 ns = 75 us
+//
+// RMT ends the RX packet after this idle period.
+// Therefore EACH ring-buffer packet is treated
+// as one complete WS2811 frame.
+//
+// This is the critical change.
+// ======================================================
+
+#define RMT_IDLE_TICKS 3000
+
+// Allow tiny variation around expected 120 symbols
+#define MIN_FRAME_SYMBOLS 118
+#define MAX_FRAME_SYMBOLS 122
 
 // ======================================================
 // REALTIME
 // ======================================================
 
-// Refresh realtime timeout with every valid frame.
-#define REALTIME_LOCK_MS 1000
-
-// If input completely disappears,
-// explicitly return control to normal WLED.
-#define SIGNAL_TIMEOUT_MS 1200
+#define REALTIME_LOCK_MS   1000
+#define SIGNAL_TIMEOUT_MS  1200
 
 
 class PassthroughUsermod : public Usermod {
@@ -70,75 +63,41 @@ class PassthroughUsermod : public Usermod {
 private:
 
   RingbufHandle_t rxRingBuffer = nullptr;
-
   bool rxReady = false;
 
-
   // ====================================================
-  // DECODER
+  // COMPLETE FRAME BUFFER
   // ====================================================
 
   uint8_t frameBuffer[FRAME_BYTES];
-
-  uint8_t currentByte = 0;
-  uint8_t bitCount    = 0;
-  uint8_t frameBytes  = 0;
-
-
-  // ====================================================
-  // STATE
-  // ====================================================
 
   bool realtimeActive = false;
 
   uint32_t lastFrameTime = 0;
 
-
   // ====================================================
   // STATISTICS
   // ====================================================
 
-  uint32_t framesReceived = 0;
-  uint32_t framesShown    = 0;
+  uint32_t rxPackets       = 0;
+  uint32_t goodFrames      = 0;
+  uint32_t shownFrames     = 0;
+  uint32_t badLengthFrames = 0;
 
-  uint32_t lastDebugTime  = 0;
+  uint16_t lastSymbolCount = 0;
 
-
-  // ====================================================
-  // RESET DECODER
-  // ====================================================
-
-  void resetDecoder()
-  {
-    currentByte = 0;
-    bitCount    = 0;
-    frameBytes  = 0;
-  }
+  uint32_t lastDebugTime = 0;
 
 
   // ====================================================
-  // ENTER / REFRESH WLED REALTIME MODE
+  // ENTER / REFRESH REALTIME
   // ====================================================
 
   void keepRealtimeActive()
   {
-    /*
-     * REALTIME_MODE_UDP is intentional.
-     *
-     * In WLED 16.0.0:
-     *
-     * REALTIME_MODE_GENERIC causes realtimeLock()
-     * itself to call strip.show().
-     *
-     * UDP mode does not.
-     *
-     * We want exactly ONE show after putting our
-     * pixels into WLED.
-     */
-
     realtimeLock(
-        REALTIME_LOCK_MS,
-        REALTIME_MODE_UDP
+      REALTIME_LOCK_MS,
+      REALTIME_MODE_UDP
     );
 
     realtimeActive = true;
@@ -146,33 +105,150 @@ private:
 
 
   // ====================================================
-  // SEND COMPLETE FRAME THROUGH WLED
+  // DECODE ONE COMPLETE RMT PACKET
+  //
+  // IMPORTANT:
+  //
+  // The RMT packet boundary itself is our frame reset.
+  //
+  // We DO NOT carry bitCount/frameBytes from one
+  // packet into another.
+  // ====================================================
+
+  bool decodePacket(
+    rmt_item32_t *items,
+    size_t count
+  )
+  {
+    if (!items)
+      return false;
+
+    lastSymbolCount = count;
+
+
+    // ==================================================
+    // FRAME LENGTH CHECK
+    // ==================================================
+    //
+    // Expected = 120 WS2811 bits.
+    //
+    // We allow a very small margin in case RMT includes
+    // an empty/end item.
+    // ==================================================
+
+    if (
+      count < MIN_FRAME_SYMBOLS ||
+      count > MAX_FRAME_SYMBOLS
+    )
+    {
+      badLengthFrames++;
+      return false;
+    }
+
+
+    memset(
+      frameBuffer,
+      0,
+      sizeof(frameBuffer)
+    );
+
+
+    uint16_t validBits = 0;
+
+
+    // ==================================================
+    // DECODE FIRST 120 REAL SYMBOLS
+    // ==================================================
+
+    for (
+      size_t i = 0;
+      i < count && validBits < FRAME_BITS;
+      i++
+    )
+    {
+      uint16_t high = items[i].duration0;
+      uint16_t low  = items[i].duration1;
+
+
+      // Ignore only a completely empty/end item.
+      if (
+        high == 0 &&
+        low == 0
+      )
+      {
+        continue;
+      }
+
+
+      // =================================================
+      // SAME DECODER THAT WORKED IN YOUR TEST
+      // =================================================
+      //
+      // duration0:
+      //
+      // ~15 = bit 0
+      // ~50 = bit 1
+      //
+      // No total H+L filtering.
+      // No level reconstruction.
+      // =================================================
+
+      bool bit =
+        high >= BIT_THRESHOLD;
+
+
+      uint16_t byteIndex =
+        validBits >> 3;
+
+
+      uint8_t bitPosition =
+        7 - (validBits & 0x07);
+
+
+      if (bit)
+      {
+        frameBuffer[byteIndex] |=
+          (1U << bitPosition);
+      }
+
+
+      validBits++;
+    }
+
+
+    // Must contain exactly our 120 bits.
+    if (validBits != FRAME_BITS)
+    {
+      badLengthFrames++;
+      return false;
+    }
+
+
+    return true;
+  }
+
+
+  // ====================================================
+  // SHOW FRAME
   // ====================================================
 
   void showFrame()
   {
-    /*
-     * First put WLED into its official realtime mode.
-     *
-     * This prevents normal effects from running
-     * against our passthrough data.
-     */
-
+    // Stop normal WLED effects.
     keepRealtimeActive();
 
 
     // ==================================================
-    // COLOR CONVERSION
-    //
-    // Incoming:
+    // INPUT:
     //
     // G R B
     //
-    // Required:
+    // OUTPUT REQUIRED:
     //
     // B R G
     //
-    // WLED setPixelColor() arguments are RGB, therefore:
+    // WLED setPixelColor() expects RGB arguments,
+    // therefore:
     //
     // R = input B
     // G = input R
@@ -180,207 +256,58 @@ private:
     // ==================================================
 
     for (
-        uint8_t i = 0;
-        i < WS2811_ICS;
-        i++
+      uint8_t i = 0;
+      i < WS2811_ICS;
+      i++
     )
     {
       uint8_t p = i * 3;
 
 
       uint8_t inputG =
-          frameBuffer[p + 0];
+        frameBuffer[p + 0];
 
       uint8_t inputR =
-          frameBuffer[p + 1];
+        frameBuffer[p + 1];
 
       uint8_t inputB =
-          frameBuffer[p + 2];
+        frameBuffer[p + 2];
 
 
       // GRB -> BRG
-
-      uint8_t outputR =
-          inputB;
-
-      uint8_t outputG =
-          inputR;
-
-      uint8_t outputB =
-          inputG;
+      uint8_t outputR = inputB;
+      uint8_t outputG = inputR;
+      uint8_t outputB = inputG;
 
 
       strip.setPixelColor(
-          i,
-          outputR,
-          outputG,
-          outputB
+        i,
+        outputR,
+        outputG,
+        outputB
       );
     }
 
 
-    /*
-     * This show() is now intentional.
-     *
-     * The difference from our earlier tests:
-     *
-     * WLED effects are blocked by realtimeMode,
-     * so strip.show() is no longer fighting
-     * strip.service().
-     */
+    // ==================================================
+    // REALTIME OUTPUT
+    // ==================================================
+    //
+    // Same principle used by WLED realtime inputs:
+    // write pixels, then show.
+    // ==================================================
 
     strip.show();
 
 
-    framesShown++;
+    shownFrames++;
 
     lastFrameTime = millis();
   }
 
 
   // ====================================================
-  // COMPLETE FRAME
-  // ====================================================
-
-  void commitFrame()
-  {
-    if (
-        frameBytes != FRAME_BYTES ||
-        bitCount != 0
-    )
-    {
-      resetDecoder();
-      return;
-    }
-
-
-    framesReceived++;
-
-
-    /*
-     * Output immediately.
-     *
-     * We don't wait for handleOverlayDraw().
-     */
-
-    showFrame();
-
-
-    /*
-     * Start receiving next frame.
-     */
-
-    resetDecoder();
-  }
-
-
-  // ====================================================
-  // PROCESS RMT ITEMS
-  // ====================================================
-
-  void processSymbols(
-      rmt_item32_t *items,
-      size_t count
-  )
-  {
-    if (!items)
-      return;
-
-
-    for (
-        size_t i = 0;
-        i < count;
-        i++
-    )
-    {
-      /*
-       * This intentionally matches the decoder
-       * that worked best in your actual tests.
-       *
-       * We use duration0 only.
-       *
-       * No H+L validation.
-       * No level0/level1 reconstruction.
-       */
-
-      uint16_t high =
-          items[i].duration0;
-
-
-      // Completely empty RMT item
-
-      if (
-          items[i].duration0 == 0 &&
-          items[i].duration1 == 0
-      )
-      {
-        continue;
-      }
-
-
-      // ----------------------------------------------
-      // Decode using measured threshold
-      // ----------------------------------------------
-
-      bool bit =
-          high >= BIT_THRESHOLD;
-
-
-      currentByte <<= 1;
-
-
-      if (bit)
-      {
-        currentByte |= 1;
-      }
-
-
-      bitCount++;
-
-
-      // ----------------------------------------------
-      // Complete byte
-      // ----------------------------------------------
-
-      if (
-          bitCount == 8
-      )
-      {
-        if (
-            frameBytes < FRAME_BYTES
-        )
-        {
-          frameBuffer[frameBytes] =
-              currentByte;
-
-          frameBytes++;
-        }
-
-
-        currentByte = 0;
-        bitCount = 0;
-      }
-
-
-      // ----------------------------------------------
-      // Complete fixed-length WS2811 frame
-      //
-      // 15 bytes = 120 bits
-      // ----------------------------------------------
-
-      if (
-          frameBytes == FRAME_BYTES &&
-          bitCount == 0
-      )
-      {
-        commitFrame();
-      }
-    }
-  }
-
-
-  // ====================================================
-  // SETUP RMT
+  // RMT SETUP
   // ====================================================
 
   bool setupRX()
@@ -389,57 +316,50 @@ private:
 
 
     config.rmt_mode =
-        RMT_MODE_RX;
+      RMT_MODE_RX;
 
 
     config.channel =
-        RX_CHANNEL;
+      RX_CHANNEL;
 
 
     config.gpio_num =
-        (gpio_num_t)INPUT_GPIO;
+      (gpio_num_t)INPUT_GPIO;
 
 
     config.clk_div =
-        RMT_CLK_DIV;
+      RMT_CLK_DIV;
 
 
-    /*
-     * Keep the exact receive configuration
-     * that produced stable Frames previously.
-     */
-
+    // 2 × 64 = 128 RMT items.
+    // Our frame needs 120.
     config.mem_block_num =
-        2;
+      2;
 
 
-    config.flags =
-        0;
+    config.flags = 0;
 
 
     config.rx_config.filter_en =
-        false;
+      false;
 
 
+    // This is now our REAL frame separator.
     config.rx_config.idle_threshold =
-        3000;
+      RMT_IDLE_TICKS;
 
 
     esp_err_t err;
 
 
     err =
-        rmt_config(
-            &config
-        );
+      rmt_config(&config);
 
 
-    if (
-        err != ESP_OK
-    )
+    if (err != ESP_OK)
     {
       Serial.print(
-          "RMT CONFIG ERROR: "
+        "RMT CONFIG ERROR: "
       );
 
       Serial.println(err);
@@ -449,19 +369,17 @@ private:
 
 
     err =
-        rmt_driver_install(
-            RX_CHANNEL,
-            4096,
-            0
-        );
+      rmt_driver_install(
+        RX_CHANNEL,
+        4096,
+        0
+      );
 
 
-    if (
-        err != ESP_OK
-    )
+    if (err != ESP_OK)
     {
       Serial.print(
-          "RMT DRIVER ERROR: "
+        "RMT DRIVER ERROR: "
       );
 
       Serial.println(err);
@@ -471,19 +389,19 @@ private:
 
 
     err =
-        rmt_get_ringbuf_handle(
-            RX_CHANNEL,
-            &rxRingBuffer
-        );
+      rmt_get_ringbuf_handle(
+        RX_CHANNEL,
+        &rxRingBuffer
+      );
 
 
     if (
-        err != ESP_OK ||
-        rxRingBuffer == nullptr
+      err != ESP_OK ||
+      rxRingBuffer == nullptr
     )
     {
       Serial.println(
-          "RMT RINGBUFFER ERROR"
+        "RMT RINGBUFFER ERROR"
       );
 
       return false;
@@ -491,18 +409,16 @@ private:
 
 
     err =
-        rmt_rx_start(
-            RX_CHANNEL,
-            true
-        );
+      rmt_rx_start(
+        RX_CHANNEL,
+        true
+      );
 
 
-    if (
-        err != ESP_OK
-    )
+    if (err != ESP_OK)
     {
       Serial.print(
-          "RMT RX START ERROR: "
+        "RMT RX START ERROR: "
       );
 
       Serial.println(err);
@@ -524,189 +440,153 @@ public:
   void setup() override
   {
     pinMode(
-        INPUT_GPIO,
-        INPUT
+      INPUT_GPIO,
+      INPUT
     );
 
 
     memset(
-        frameBuffer,
-        0,
-        sizeof(frameBuffer)
+      frameBuffer,
+      0,
+      sizeof(frameBuffer)
     );
 
 
     Serial.println();
 
     Serial.println(
-        "================================"
+      "================================"
     );
-
 
     Serial.println(
-        "Passthrough Usermod STARTED"
+      "Passthrough Usermod STARTED"
     );
-
 
     Serial.print(
-        "Input GPIO: "
+      "Input GPIO: "
     );
 
     Serial.println(
-        INPUT_GPIO
+      INPUT_GPIO
     );
-
 
     Serial.println(
-        "Output: WLED REALTIME"
+      "Output: WLED REALTIME"
     );
-
 
     Serial.println(
-        "WLED: v16.0.0"
+      "WLED: v16.0.0"
     );
-
 
     Serial.println(
-        "RMT: LEGACY RX"
+      "RMT: LEGACY RX"
     );
-
 
     Serial.println(
-        "RMT RX Channel: 6"
+      "RMT RX Channel: 6"
     );
-
 
     Serial.println(
-        "RMT blocks: 2"
+      "RMT blocks: 2"
     );
-
-
-    Serial.println(
-        "Decoder: SIMPLE duration0"
-    );
-
 
     Serial.print(
-        "Physical LEDs: "
+      "Physical LEDs: "
     );
 
     Serial.println(
-        PHYSICAL_LEDS
+      PHYSICAL_LEDS
     );
-
 
     Serial.print(
-        "WS2811 ICs: "
+      "WS2811 ICs: "
     );
 
     Serial.println(
-        WS2811_ICS
+      WS2811_ICS
     );
-
 
     Serial.print(
-        "Frame bytes: "
+      "Expected symbols: "
     );
 
     Serial.println(
-        FRAME_BYTES
+      FRAME_BITS
     );
 
+    Serial.println(
+      "Frame sync: RMT IDLE BOUNDARY"
+    );
 
     Serial.print(
-        "Frame bits: "
+      "Idle threshold: "
     );
 
     Serial.println(
-        FRAME_BITS
+      RMT_IDLE_TICKS
     );
-
 
     Serial.println(
-        "Bit 0: H14~15"
+      "Bit 0: H14~15"
     );
-
 
     Serial.println(
-        "Bit 1: H50~51"
+      "Bit 1: H50~51"
     );
-
 
     Serial.println(
-        "Threshold: H >= 30"
+      "Threshold: H >= 30"
     );
-
 
     Serial.println(
-        "Input: GRB"
+      "Input color: GRB"
     );
-
 
     Serial.println(
-        "Output: BRG"
+      "Output color: BRG"
     );
-
 
     Serial.println(
-        "WLED realtime mode: UDP"
+      "Effects: OFF during realtime"
     );
-
 
     Serial.println(
-        "Effects during passthrough: BLOCKED"
+      "Effects: AUTO RESTORE"
     );
-
 
     Serial.println(
-        "Direct realtime strip.show(): ENABLED"
+      "================================"
     );
 
 
-    Serial.println(
-        "handleOverlayDraw(): NOT USED"
-    );
-
-
-    Serial.println(
-        "================================"
-    );
-
-
-    if (
-        setupRX()
-    )
+    if (setupRX())
     {
       rxReady = true;
 
-
       Serial.println(
-          "RMT RX READY"
+        "RMT RX READY"
       );
     }
     else
     {
       Serial.println(
-          "RMT RX FAILED"
+        "RMT RX FAILED"
       );
-
 
       return;
     }
 
 
     Serial.println(
-        "Passthrough READY"
+      "Passthrough READY"
     );
 
-
     Serial.println(
-        "Waiting for WS2811 DATA..."
+      "Waiting for synchronized frames..."
     );
 
-
     Serial.println(
-        "================================"
+      "================================"
     );
   }
 
@@ -718,78 +598,84 @@ public:
   void loop() override
   {
     if (
-        !rxReady ||
-        rxRingBuffer == nullptr
+      !rxReady ||
+      rxRingBuffer == nullptr
     )
     {
       return;
     }
 
 
-    // --------------------------------------------------
-    // NON-BLOCKING RMT RECEIVE
-    // --------------------------------------------------
+    // =================================================
+    // RECEIVE ONE COMPLETE RMT FRAME
+    // =================================================
 
-    size_t receivedSize =
-        0;
+    size_t receivedSize = 0;
 
 
     rmt_item32_t *items =
-        (rmt_item32_t *)
-        xRingbufferReceive(
-            rxRingBuffer,
-            &receivedSize,
-            0
-        );
+      (rmt_item32_t *)
+      xRingbufferReceive(
+        rxRingBuffer,
+        &receivedSize,
+        0
+      );
 
 
     if (items)
     {
       size_t count =
-          receivedSize /
-          sizeof(rmt_item32_t);
+        receivedSize /
+        sizeof(rmt_item32_t);
 
 
-      processSymbols(
+      rxPackets++;
+
+
+      // =================================================
+      // CRITICAL:
+      //
+      // Each ring-buffer packet starts fresh.
+      // No decoder state carries over from an old frame.
+      // =================================================
+
+      if (
+        decodePacket(
           items,
           count
-      );
+        )
+      )
+      {
+        goodFrames++;
+
+        showFrame();
+      }
 
 
       vRingbufferReturnItem(
-          rxRingBuffer,
-          (void *)items
+        rxRingBuffer,
+        (void *)items
       );
     }
 
 
     // =================================================
-    // RETURN TO NORMAL WLED
+    // RETURN TO NORMAL WLED EFFECTS
     // =================================================
 
     if (
-        realtimeActive &&
-        millis() - lastFrameTime >
-        SIGNAL_TIMEOUT_MS
+      realtimeActive &&
+      millis() - lastFrameTime >
+      SIGNAL_TIMEOUT_MS
     )
     {
-      /*
-       * Official WLED realtime exit.
-       *
-       * Restores normal brightness/state and
-       * resumes the normal effects engine.
-       */
-
       exitRealtime();
-
 
       realtimeActive = false;
 
-      resetDecoder();
-
 
       Serial.println(
-          "Realtime OFF -> WLED effects"
+        "Realtime OFF -> WLED effects"
       );
     }
 
@@ -799,68 +685,76 @@ public:
     // =================================================
 
     uint32_t now =
-        millis();
+      millis();
 
 
     if (
-        now - lastDebugTime >= 2000
+      now - lastDebugTime >= 2000
     )
     {
-      lastDebugTime =
-          now;
+      lastDebugTime = now;
 
 
       Serial.print(
-          "Frames: "
+        "Packets: "
       );
 
       Serial.print(
-          framesReceived
-      );
-
-
-      Serial.print(
-          "  Shown: "
-      );
-
-      Serial.print(
-          framesShown
+        rxPackets
       );
 
 
       Serial.print(
-          "  RX Bytes: "
+        "  Good: "
       );
 
       Serial.print(
-          frameBytes
-      );
-
-
-      Serial.print(
-          "  Bits: "
-      );
-
-      Serial.print(
-          bitCount
+        goodFrames
       );
 
 
       Serial.print(
-          "  Mode: "
+        "  Shown: "
+      );
+
+      Serial.print(
+        shownFrames
+      );
+
+
+      Serial.print(
+        "  BadLen: "
+      );
+
+      Serial.print(
+        badLengthFrames
+      );
+
+
+      Serial.print(
+        "  Symbols: "
+      );
+
+      Serial.print(
+        lastSymbolCount
+      );
+
+
+      Serial.print(
+        "  Mode: "
       );
 
 
       if (realtimeActive)
       {
         Serial.println(
-            "REALTIME"
+          "REALTIME"
         );
       }
       else
       {
         Serial.println(
-            "WLED"
+          "WLED"
         );
       }
     }
@@ -872,58 +766,54 @@ public:
   // ====================================================
 
   void addToJsonInfo(
-      JsonObject &root
+    JsonObject &root
   ) override
   {
     JsonObject info =
-        root["u"]
-        .createNestedObject(
-            "Passthrough"
-        );
+      root["u"]
+      .createNestedObject(
+        "Passthrough"
+      );
 
 
     info["input"] =
-        INPUT_GPIO;
-
+      INPUT_GPIO;
 
     info["output"] =
-        "WLED realtime";
-
+      "WLED realtime";
 
     info["rmt_channel"] =
-        6;
-
+      6;
 
     info["physical_leds"] =
-        PHYSICAL_LEDS;
-
+      PHYSICAL_LEDS;
 
     info["ws2811_ics"] =
-        WS2811_ICS;
+      WS2811_ICS;
 
-
-    info["frame_bits"] =
-        FRAME_BITS;
-
+    info["expected_symbols"] =
+      FRAME_BITS;
 
     info["input_order"] =
-        "GRB";
-
+      "GRB";
 
     info["output_order"] =
-        "BRG";
+      "BRG";
 
+    info["packets"] =
+      rxPackets;
 
-    info["realtime"] =
-        realtimeActive;
-
-
-    info["frames"] =
-        framesReceived;
-
+    info["good_frames"] =
+      goodFrames;
 
     info["shown"] =
-        framesShown;
+      shownFrames;
+
+    info["bad_length"] =
+      badLengthFrames;
+
+    info["last_symbols"] =
+      lastSymbolCount;
   }
 
 
@@ -934,14 +824,8 @@ public:
 };
 
 
-// ======================================================
-// REGISTER
-// ======================================================
-
-static PassthroughUsermod
-passthroughUsermod;
-
+static PassthroughUsermod passthroughUsermod;
 
 REGISTER_USERMOD(
-    passthroughUsermod
+  passthroughUsermod
 );
