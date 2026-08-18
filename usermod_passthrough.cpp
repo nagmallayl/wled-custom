@@ -26,8 +26,8 @@
 
 #define BIT_THRESHOLD 30
 
-// Use the same idle value from the last test
-#define RMT_IDLE_TICKS 1000
+// المعدل الذي نجح سابقًا في الاستقبال المستمر
+#define RMT_IDLE_TICKS 3000
 
 // Print decoded frame once per second
 #define FRAME_DEBUG_INTERVAL_MS 1000
@@ -207,6 +207,7 @@ private:
     config.rx_config.filter_en =
       false;
 
+    // التعديل الرئيسي
     config.rx_config.idle_threshold =
       RMT_IDLE_TICKS;
 
@@ -494,6 +495,9 @@ public:
 
     info["frame_bits"] =
       FRAME_BITS;
+
+    info["idle_ticks"] =
+      RMT_IDLE_TICKS;
 
     info["packets"] =
       packetsReceived;
