@@ -18,8 +18,8 @@
 // كل WS2811 IC يتحكم في 3 LED
 // 60 / 3 = 20 IC
 
-#define PHYSICAL_LEDS 60
-#define WS2811_ICS    20
+#define PHYSICAL_LEDS 15
+#define WS2811_ICS    5
 
 // كل IC يستقبل 3 بايت
 #define FRAME_BYTES   (WS2811_ICS * 3)
