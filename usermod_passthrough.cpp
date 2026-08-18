@@ -1,59 +1,83 @@
 #include "wled.h"
 #include "driver/rmt.h"
 
-
 // ======================================================
-// PASSTHROUGH SETTINGS
+// PINS
 // ======================================================
 
-// DATA coming from LDD11
-#define PASSTHROUGH_INPUT_PIN 25
-
-// DATA going to LED strip
-// CHANGE THIS if your WLED LED output uses another GPIO
+#define PASSTHROUGH_INPUT_PIN  25
 #define PASSTHROUGH_OUTPUT_PIN 16
 
-
 // ======================================================
-// STRIP
+// WS2811
 // ======================================================
 
 // 60 physical LEDs
-// Each WS2811 IC controls 3 physical LEDs
-//
+// Each WS2811 IC controls 3 LEDs
 // 60 / 3 = 20 ICs
 
 #define PHYSICAL_LEDS 60
-#define PIXEL_COUNT 20
+#define PIXEL_COUNT   20
 
-// 20 IC × 3 bytes
-#define FRAME_BYTES (PIXEL_COUNT * 3)
+// 3 bytes per WS2811 IC
+#define FRAME_BYTES   (PIXEL_COUNT * 3)
 
-// 800 kHz WS2811
-#define WS2811_KHZ 800
+// 800 kHz
+#define WS2811_KHZ    800
 
 
 // ======================================================
 // RMT
 // ======================================================
 
+// ESP32 classic RMT clock:
 // 80 MHz / 2 = 40 MHz
 // 1 tick = 25 ns
 
 #define RMT_CLK_DIV 2
 
-// WS2811 reset
+// WS2811 reset / end of frame
 #define RMT_IDLE_THRESHOLD 2000
 
+// Ignore pulses shorter than this
 #define RMT_FILTER_THRESHOLD 1
 
 
-// RX channel
+// ======================================================
+// RMT CHANNELS
+// ======================================================
+
+// RX = channel 0
 #define RX_CHANNEL RMT_CHANNEL_0
 
-// TX channel
+// TX = channel 1
 #define TX_CHANNEL RMT_CHANNEL_1
 
+
+// ======================================================
+// RMT MEMORY
+// ======================================================
+
+// ESP32 classic has 8 RMT memory blocks total.
+//
+// OLD:
+// RX = 8
+// TX = 8
+//
+// This caused:
+// TX config error: 258
+//
+// NEW:
+// RX = 4
+// TX = 4
+
+#define RX_MEM_BLOCKS 4
+#define TX_MEM_BLOCKS 4
+
+
+// ======================================================
+// USERMOD
+// ======================================================
 
 class PassthroughUsermod : public Usermod {
 
@@ -65,134 +89,86 @@ private:
   bool txReady = false;
 
 
-  // --------------------------------------------------
-  // Incoming frame
-  // --------------------------------------------------
+  // ====================================================
+  // Frame buffer
+  // ====================================================
 
   uint8_t frameBuffer[FRAME_BYTES];
 
   uint16_t frameBytes = 0;
-
-
-  // --------------------------------------------------
-  // Statistics
-  // --------------------------------------------------
-
-  uint32_t framesReceived = 0;
-
-  uint32_t lastDebug = 0;
-
-
-  // --------------------------------------------------
-  // Current byte decoder
-  // --------------------------------------------------
 
   uint8_t currentByte = 0;
 
   uint8_t bitCount = 0;
 
 
-  // --------------------------------------------------
-  // RMT TX buffer
-  // --------------------------------------------------
+  // ====================================================
+  // TX buffer
+  // ====================================================
 
   rmt_item32_t txItems[FRAME_BYTES * 8];
 
 
-  // ==================================================
-  // Decode WS2811 bit
-  // ==================================================
+  // ====================================================
+  // Statistics
+  // ====================================================
 
-  bool decodeBit(
-      const rmt_item32_t &item
-  ) {
+  uint32_t framesReceived = 0;
 
-    uint16_t high =
-        item.duration0;
-
-    uint16_t low =
-        item.duration1;
+  uint32_t lastDebug = 0;
 
 
-    uint16_t total =
-        high + low;
+  // ====================================================
+  // Decode one WS2811 bit
+  // ====================================================
 
+  bool decodeBit(const rmt_item32_t &item)
+  {
+    uint16_t high = item.duration0;
+    uint16_t low  = item.duration1;
 
-    /*
-     * 800 kHz:
-     *
-     * 1 bit ≈ 1.25 us
-     *
-     * 40 MHz RMT clock:
-     *
-     * 1.25 us ≈ 50 ticks
-     */
+    uint16_t total = high + low;
 
-    if (
-        total < 35 ||
-        total > 65
-    ) {
+    // 800 kHz:
+    // approximately 50 RMT ticks per bit
 
+    if (total < 35 || total > 65)
       return false;
-    }
 
-
-    /*
-     * WS2811:
-     *
-     * longer HIGH = 1
-     * shorter HIGH = 0
-     */
+    // Long HIGH = 1
+    // Short HIGH = 0
 
     return high > low;
   }
 
 
-  // ==================================================
-  // Decode RMT RX symbols
-  // ==================================================
+  // ====================================================
+  // Decode received RMT symbols
+  // ====================================================
 
   void decodeSymbols(
       rmt_item32_t *items,
-      size_t count
-  ) {
-
+      size_t count)
+  {
     if (!items)
       return;
 
 
-    for (
-        size_t i = 0;
-        i < count;
-        i++
-    ) {
+    for (size_t i = 0; i < count; i++) {
 
-      if (
-          frameBytes >= FRAME_BYTES
-      ) {
-
+      if (frameBytes >= FRAME_BYTES)
         break;
-      }
-
-
-      rmt_item32_t &item =
-          items[i];
 
 
       uint16_t high =
-          item.duration0;
+          items[i].duration0;
 
       uint16_t low =
-          item.duration1;
+          items[i].duration1;
 
 
-      if (
-          high == 0 &&
-          low == 0
-      ) {
-
+      if (high == 0 && low == 0)
         continue;
-      }
 
 
       uint16_t total =
@@ -203,41 +179,30 @@ private:
        * Ignore reset / invalid pulses.
        */
 
-      if (
-          total < 35 ||
-          total > 65
-      ) {
-
+      if (total < 35 || total > 65)
         continue;
-      }
 
 
       bool bit =
-          decodeBit(item);
+          decodeBit(items[i]);
 
 
       currentByte <<= 1;
 
 
-      if (bit) {
-
+      if (bit)
         currentByte |= 1;
-      }
 
 
       bitCount++;
 
 
-      if (
-          bitCount == 8
-      ) {
+      if (bitCount == 8) {
 
         frameBuffer[frameBytes] =
             currentByte;
 
-
         frameBytes++;
-
 
         currentByte = 0;
 
@@ -247,25 +212,25 @@ private:
   }
 
 
-  // ==================================================
-  // Convert one byte
+  // ====================================================
+  // COLOR CONVERSION
   //
   // Incoming:
   //     GRB
   //
-  // Current desired test:
+  // Output:
   //     BRG
   //
-  // Later we can change this very easily.
-  // ==================================================
+  // G R B
+  // ↓ ↓ ↓
+  // B R G
+  // ====================================================
 
-  void convertFrame() {
-
-    for (
-        uint16_t i = 0;
-        i < PIXEL_COUNT;
-        i++
-    ) {
+  void convertFrame()
+  {
+    for (uint16_t i = 0;
+         i < PIXEL_COUNT;
+         i++) {
 
       uint8_t g =
           frameBuffer[i * 3 + 0];
@@ -277,9 +242,7 @@ private:
           frameBuffer[i * 3 + 2];
 
 
-      /*
-       * GRB -> BRG
-       */
+      // GRB -> BRG
 
       frameBuffer[i * 3 + 0] = b;
 
@@ -290,44 +253,43 @@ private:
   }
 
 
-  // ==================================================
-  // Create WS2811 RMT TX data
-  // ==================================================
+  // ====================================================
+  // Build WS2811 waveform
+  // ====================================================
 
-  uint16_t buildTxBuffer() {
-
+  uint16_t buildTxBuffer()
+  {
     uint16_t txCount = 0;
 
 
     /*
-     * 800 kHz / 40 MHz:
+     * 40 MHz RMT clock
      *
-     * 1.25 us = 50 ticks
+     * 800 kHz WS2811
      *
-     * Typical WS2811 timing:
+     * 1 bit = 50 ticks
      *
-     * 0 = HIGH ~16 ticks
-     *     LOW  ~34 ticks
+     * 0:
+     * HIGH = 16
+     * LOW  = 34
      *
-     * 1 = HIGH ~32 ticks
-     *     LOW  ~18 ticks
+     * 1:
+     * HIGH = 32
+     * LOW  = 18
      */
 
-    for (
-        uint16_t byteIndex = 0;
-        byteIndex < FRAME_BYTES;
-        byteIndex++
-    ) {
+
+    for (uint16_t byteIndex = 0;
+         byteIndex < FRAME_BYTES;
+         byteIndex++) {
 
       uint8_t value =
           frameBuffer[byteIndex];
 
 
-      for (
-          int8_t bit = 7;
-          bit >= 0;
-          bit--
-      ) {
+      for (int8_t bit = 7;
+           bit >= 0;
+           bit--) {
 
         bool one =
             value & (1 << bit);
@@ -360,45 +322,33 @@ private:
   }
 
 
-  // ==================================================
-  // Send frame directly using RMT
-  // ==================================================
+  // ====================================================
+  // Transmit frame
+  // ====================================================
 
-  void transmitFrame() {
-
-    if (
-        frameBytes != FRAME_BYTES
-    ) {
-
+  void transmitFrame()
+  {
+    if (frameBytes != FRAME_BYTES)
       return;
-    }
 
 
-    /*
-     * First convert colors.
-     */
+    // Color conversion
 
     convertFrame();
 
 
-    /*
-     * Build raw WS2811 waveform.
-     */
+    // Build waveform
 
     uint16_t txCount =
         buildTxBuffer();
 
 
     /*
-     * Send directly to GPIO.
+     * Send using RMT TX.
      *
-     * No:
-     *
-     * strip.setPixelColor()
-     * strip.show()
-     *
-     * This is the important part
-     * for reducing latency.
+     * rmt_write_items() handles
+     * the data using the configured
+     * RMT memory.
      */
 
     esp_err_t result =
@@ -410,21 +360,19 @@ private:
         );
 
 
-    if (
-        result == ESP_OK
-    ) {
+    if (result == ESP_OK) {
 
       framesReceived++;
     }
   }
 
 
-  // ==================================================
-  // Initialize RX
-  // ==================================================
+  // ====================================================
+  // RX SETUP
+  // ====================================================
 
-  bool setupRX() {
-
+  bool setupRX()
+  {
     rmt_config_t config = {};
 
 
@@ -446,11 +394,16 @@ private:
 
 
     /*
-     * More memory for RX.
+     * IMPORTANT:
+     *
+     * 4 blocks instead of 8.
+     *
+     * The RX ring buffer will
+     * provide the frame in chunks.
      */
 
     config.mem_block_num =
-        8;
+        RX_MEM_BLOCKS;
 
 
     config.flags = 0;
@@ -471,22 +424,16 @@ private:
 
 
     esp_err_t result =
-        rmt_config(
-            &config
-        );
+        rmt_config(&config);
 
 
-    if (
-        result != ESP_OK
-    ) {
+    if (result != ESP_OK) {
 
       Serial.print(
           "RX config error: "
       );
 
-      Serial.println(
-          result
-      );
+      Serial.println(result);
 
       return false;
     }
@@ -500,17 +447,13 @@ private:
         );
 
 
-    if (
-        result != ESP_OK
-    ) {
+    if (result != ESP_OK) {
 
       Serial.print(
           "RX driver error: "
       );
 
-      Serial.println(
-          result
-      );
+      Serial.println(result);
 
       return false;
     }
@@ -543,17 +486,13 @@ private:
         );
 
 
-    if (
-        result != ESP_OK
-    ) {
+    if (result != ESP_OK) {
 
       Serial.print(
           "RX start error: "
       );
 
-      Serial.println(
-          result
-      );
+      Serial.println(result);
 
       return false;
     }
@@ -563,12 +502,12 @@ private:
   }
 
 
-  // ==================================================
-  // Initialize TX
-  // ==================================================
+  // ====================================================
+  // TX SETUP
+  // ====================================================
 
-  bool setupTX() {
-
+  bool setupTX()
+  {
     rmt_config_t config = {};
 
 
@@ -589,16 +528,23 @@ private:
         RMT_CLK_DIV;
 
 
+    /*
+     * IMPORTANT:
+     *
+     * 4 blocks instead of 8.
+     *
+     * RX = 4
+     * TX = 4
+     *
+     * Total = 8
+     */
+
     config.mem_block_num =
-        8;
+        TX_MEM_BLOCKS;
 
 
     config.flags = 0;
 
-
-    /*
-     * TX configuration
-     */
 
     config.tx_config.loop_en =
         false;
@@ -617,22 +563,16 @@ private:
 
 
     esp_err_t result =
-        rmt_config(
-            &config
-        );
+        rmt_config(&config);
 
 
-    if (
-        result != ESP_OK
-    ) {
+    if (result != ESP_OK) {
 
       Serial.print(
           "TX config error: "
       );
 
-      Serial.println(
-          result
-      );
+      Serial.println(result);
 
       return false;
     }
@@ -646,17 +586,13 @@ private:
         );
 
 
-    if (
-        result != ESP_OK
-    ) {
+    if (result != ESP_OK) {
 
       Serial.print(
           "TX driver error: "
       );
 
-      Serial.println(
-          result
-      );
+      Serial.println(result);
 
       return false;
     }
@@ -669,12 +605,12 @@ private:
 public:
 
 
-  // ==================================================
+  // ====================================================
   // SETUP
-  // ==================================================
+  // ====================================================
 
-  void setup() override {
-
+  void setup() override
+  {
     pinMode(
         PASSTHROUGH_INPUT_PIN,
         INPUT
@@ -711,7 +647,7 @@ public:
 
 
     Serial.println(
-        "RMT: DIRECT RX + TX"
+        "RMT: LEGACY DIRECT RX + TX"
     );
 
 
@@ -753,12 +689,30 @@ public:
 
 
     Serial.println(
-        "Input: GRB"
+        "Input:  GRB"
     );
 
 
     Serial.println(
-        "Conversion: GRB -> BRG"
+        "Output: BRG"
+    );
+
+
+    Serial.print(
+        "RX blocks: "
+    );
+
+    Serial.println(
+        RX_MEM_BLOCKS
+    );
+
+
+    Serial.print(
+        "TX blocks: "
+    );
+
+    Serial.println(
+        TX_MEM_BLOCKS
     );
 
 
@@ -767,13 +721,9 @@ public:
     );
 
 
-    // ------------------------------------------------
     // RX
-    // ------------------------------------------------
 
-    if (
-        setupRX()
-    ) {
+    if (setupRX()) {
 
       rxReady = true;
 
@@ -791,13 +741,9 @@ public:
     }
 
 
-    // ------------------------------------------------
     // TX
-    // ------------------------------------------------
 
-    if (
-        setupTX()
-    ) {
+    if (setupTX()) {
 
       txReady = true;
 
@@ -819,9 +765,11 @@ public:
         "Passthrough READY"
     );
 
+
     Serial.println(
-        "Waiting for WS2811..."
+        "Waiting for WS2811 DATA..."
     );
+
 
     Serial.println(
         "================================"
@@ -829,12 +777,12 @@ public:
   }
 
 
-  // ==================================================
+  // ====================================================
   // LOOP
-  // ==================================================
+  // ====================================================
 
-  void loop() override {
-
+  void loop() override
+  {
     if (!rxReady)
       return;
 
@@ -847,12 +795,13 @@ public:
       return;
 
 
-    size_t receivedSize =
-        0;
+    size_t receivedSize = 0;
 
 
     /*
-     * Non-blocking RX.
+     * NON-BLOCKING.
+     *
+     * Important for minimizing delay.
      */
 
     rmt_item32_t *items =
@@ -874,8 +823,8 @@ public:
 
 
     /*
-     * Add received symbols
-     * to our 20-pixel frame.
+     * Add this chunk to
+     * the current frame.
      */
 
     decodeSymbols(
@@ -885,7 +834,8 @@ public:
 
 
     /*
-     * Release RMT memory.
+     * Release RX memory
+     * immediately.
      */
 
     vRingbufferReturnItem(
@@ -895,11 +845,7 @@ public:
 
 
     /*
-     * We received exactly:
-     *
-     * 20 IC × 3 bytes
-     *
-     * = 60 bytes
+     * 60 bytes received.
      */
 
     if (
@@ -910,8 +856,8 @@ public:
 
 
       /*
-       * Prepare immediately
-       * for next frame.
+       * Immediately prepare
+       * for the next frame.
        */
 
       frameBytes = 0;
@@ -923,7 +869,8 @@ public:
 
 
     /*
-     * Debug only once per second.
+     * Serial debug only once
+     * every second.
      */
 
     uint32_t now =
@@ -948,14 +895,14 @@ public:
   }
 
 
-  // ==================================================
+  // ====================================================
   // WLED INFO
-  // ==================================================
+  // ====================================================
 
   void addToJsonInfo(
       JsonObject &root
-  ) override {
-
+  ) override
+  {
     JsonObject info =
         root["u"]
         .createNestedObject(
@@ -983,8 +930,20 @@ public:
         "800 kHz";
 
 
-    info["conversion"] =
-        "GRB -> BRG";
+    info["input_order"] =
+        "GRB";
+
+
+    info["output_order"] =
+        "BRG";
+
+
+    info["rx_blocks"] =
+        RX_MEM_BLOCKS;
+
+
+    info["tx_blocks"] =
+        TX_MEM_BLOCKS;
 
 
     info["frames"] =
@@ -992,15 +951,15 @@ public:
   }
 
 
-  uint16_t getId() override {
-
+  uint16_t getId() override
+  {
     return 0x5041;
   }
 };
 
 
 // ======================================================
-// REGISTER
+// REGISTER USERMOD
 // ======================================================
 
 static PassthroughUsermod
