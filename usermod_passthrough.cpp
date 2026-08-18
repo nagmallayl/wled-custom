@@ -2,42 +2,39 @@
 #include "driver/rmt.h"
 
 #define PASSTHROUGH_INPUT_PIN 25
-
 #define PASSTHROUGH_RMT_CHANNEL RMT_CHANNEL_0
 
-#define MAX_LEDS 300
+// ==================================================
+// STRIP SETTINGS
+// ==================================================
 
-/*
- * RMT clock:
- *
- * ESP32 APB clock = 80 MHz
- * clk_div = 2
- *
- * RMT clock = 40 MHz
- * 1 tick = 25 ns
- *
- * WS2811 bit ≈ 1.25 us
- * ≈ 50 ticks
- */
+// 60 physical LEDs
+// Each WS2811 IC controls 3 LEDs
+#define PHYSICAL_LEDS 60
 
+// 60 / 3 = 20 WS2811 ICs
+#define PIXEL_COUNT 20
+
+// 3 bytes per WS2811 IC
+#define FRAME_BYTES (PIXEL_COUNT * 3)
+
+// WS2811 data speed
+#define WS2811_KHZ 800
+
+
+// ==================================================
+// RMT SETTINGS
+// ==================================================
+
+// ESP32 RMT clock:
+// 80 MHz / 2 = 40 MHz
+// 1 tick = 25 ns
 #define RMT_CLK_DIV 2
 
-/*
- * WS2811 reset time.
- *
- * 2000 ticks × 25 ns
- * = 50 us
- */
-
+// WS2811 reset time
 #define RMT_IDLE_THRESHOLD 2000
 
-/*
- * Ignore pulses shorter than:
- *
- * 4 ticks × 25 ns
- * = 100 ns
- */
-
+// Ignore very short pulses
 #define RMT_FILTER_THRESHOLD 4
 
 
@@ -49,67 +46,59 @@ private:
 
   bool rmtReady = false;
 
+  // 20 IC × 3 bytes
+  // = 60 bytes
+  uint8_t frameBuffer[FRAME_BYTES];
+
+  uint16_t frameBytes = 0;
+
   uint32_t framesReceived = 0;
-  uint32_t lastDebugTime = 0;
+
+  uint32_t lastDebug = 0;
 
 
-  /*
-   * Decode one WS2811 bit.
-   *
-   * Logical 0:
-   *
-   * HIGH ≈ 0.4 us
-   * LOW  ≈ 0.85 us
-   *
-   * Logical 1:
-   *
-   * HIGH ≈ 0.8 us
-   * LOW  ≈ 0.45 us
-   *
-   * Therefore:
-   *
-   * HIGH > LOW = 1
-   * HIGH < LOW = 0
-   */
+  // ==================================================
+  // Decode one WS2811 bit
+  // ==================================================
 
   bool decodeBit(
       const rmt_item32_t &item
   ) {
 
-    uint16_t high =
-        item.duration0;
+    uint16_t high = item.duration0;
+    uint16_t low  = item.duration1;
 
-    uint16_t low =
-        item.duration1;
-
-    uint16_t total =
-        high + low;
-
+    uint16_t total = high + low;
 
     /*
-     * Expected WS2811 bit:
+     * 800 kHz WS2811:
      *
-     * approximately 50 RMT ticks.
+     * 1 bit ≈ 1.25 us
      *
-     * Allow a reasonable tolerance.
+     * RMT:
+     *
+     * 1 tick = 25 ns
+     *
+     * 1.25 us ≈ 50 ticks
      */
 
-    if (total < 35 ||
-        total > 65) {
-
+    if (total < 35 || total > 65)
       return false;
-    }
 
+    /*
+     * Longer HIGH = logic 1
+     * Shorter HIGH = logic 0
+     */
 
     return high > low;
   }
 
 
-  /*
-   * Decode one complete WS2811 frame.
-   */
+  // ==================================================
+  // Decode RMT symbols
+  // ==================================================
 
-  void processFrame(
+  void decodeSymbols(
       rmt_item32_t *items,
       size_t itemCount
   ) {
@@ -117,59 +106,32 @@ private:
     if (!items)
       return;
 
-    if (itemCount < 24)
-      return;
-
 
     /*
-     * Maximum:
-     *
-     * 300 LEDs × 3 bytes
+     * These need to survive between
+     * RMT chunks because one WS2811
+     * frame may be split across chunks.
      */
 
-    uint8_t bytes[
-        MAX_LEDS * 3
-    ];
+    static uint8_t currentByte = 0;
+    static uint8_t bitCount = 0;
 
-
-    uint16_t byteCount = 0;
-
-    uint8_t currentByte = 0;
-
-    uint8_t bitCount = 0;
-
-
-    /*
-     * Decode every RMT item.
-     */
 
     for (
         size_t i = 0;
         i < itemCount &&
-        byteCount < MAX_LEDS * 3;
+        frameBytes < FRAME_BYTES;
         i++
     ) {
 
-      rmt_item32_t &item =
-          items[i];
+      rmt_item32_t &item = items[i];
+
+      uint16_t high = item.duration0;
+      uint16_t low  = item.duration1;
 
 
-      uint16_t high =
-          item.duration0;
-
-      uint16_t low =
-          item.duration1;
-
-
-      /*
-       * Ignore empty items.
-       */
-
-      if (high == 0 &&
-          low == 0) {
-
+      if (high == 0 && low == 0)
         continue;
-      }
 
 
       uint16_t total =
@@ -177,13 +139,13 @@ private:
 
 
       /*
-       * Ignore anything that does not
-       * look like a WS2811 bit.
+       * Only accept WS2811 800 kHz bits.
        */
 
-      if (total < 35 ||
-          total > 65) {
-
+      if (
+          total < 35 ||
+          total > 65
+      ) {
         continue;
       }
 
@@ -208,95 +170,98 @@ private:
 
       if (bitCount == 8) {
 
-        bytes[byteCount] =
+        frameBuffer[frameBytes] =
             currentByte;
 
-        byteCount++;
+        frameBytes++;
 
         currentByte = 0;
 
         bitCount = 0;
       }
     }
+  }
 
 
-    /*
-     * Need at least one RGB LED.
-     */
+  // ==================================================
+  // Send complete frame
+  //
+  // Incoming:
+  //     GRB
+  //
+  // Required:
+  //     BRG
+  // ==================================================
 
-    if (byteCount < 3)
+  void sendFrame() {
+
+    if (
+        frameBytes != FRAME_BYTES
+    )
       return;
 
 
     /*
-     * 3 bytes per LED.
-     */
-
-    uint16_t ledCount =
-        byteCount / 3;
-
-
-    if (ledCount > MAX_LEDS)
-      ledCount = MAX_LEDS;
-
-
-    /*
-     * Never write beyond the
-     * WLED configured strip length.
-     */
-
-    if (
-        ledCount >
-        strip.getLength()
-    ) {
-
-      ledCount =
-          strip.getLength();
-    }
-
-
-    /*
-     * Incoming data:
+     * We have:
      *
-     * GRB
+     * 20 ICs
      *
-     * G = byte 0
-     * R = byte 1
-     * B = byte 2
-     *
-     * WLED output:
-     *
-     * RGB
+     * 60 bytes
      */
 
     for (
         uint16_t i = 0;
-        i < ledCount;
+        i < PIXEL_COUNT;
         i++
     ) {
 
+      /*
+       * Incoming order:
+       *
+       * byte 0 = G
+       * byte 1 = R
+       * byte 2 = B
+       */
+
       uint8_t g =
-          bytes[i * 3 + 0];
+          frameBuffer[i * 3 + 0];
 
       uint8_t r =
-          bytes[i * 3 + 1];
+          frameBuffer[i * 3 + 1];
 
       uint8_t b =
-          bytes[i * 3 + 2];
+          frameBuffer[i * 3 + 2];
 
+
+      /*
+       * Required output:
+       *
+       * B R G
+       *
+       * WLED setPixelColor()
+       * receives RGB.
+       *
+       * Therefore:
+       *
+       * R = B
+       * G = R
+       * B = G
+       */
 
       strip.setPixelColor(
           i,
+          b,
           r,
-          g,
-          b
+          g
       );
     }
 
 
     /*
-     * Send the converted data
-     * to the LED strip.
+     * Send the 20-pixel frame.
+     *
+     * Each pixel represents
+     * 3 physical LEDs on the strip.
      */
 
     strip.show();
@@ -306,9 +271,7 @@ private:
 
 
     /*
-     * Diagnostic information.
-     *
-     * Print once per second.
+     * Debug once per second.
      */
 
     uint32_t now =
@@ -316,11 +279,10 @@ private:
 
 
     if (
-        now - lastDebugTime >=
-        1000
+        now - lastDebug >= 1000
     ) {
 
-      lastDebugTime = now;
+      lastDebug = now;
 
 
       Serial.println();
@@ -340,11 +302,20 @@ private:
 
 
       Serial.print(
-          "RMT symbols: "
+          "Physical LEDs: "
       );
 
       Serial.println(
-          itemCount
+          PHYSICAL_LEDS
+      );
+
+
+      Serial.print(
+          "WS2811 ICs: "
+      );
+
+      Serial.println(
+          PIXEL_COUNT
       );
 
 
@@ -353,16 +324,17 @@ private:
       );
 
       Serial.println(
-          byteCount
+          FRAME_BYTES
       );
 
-
-      Serial.print(
-          "LEDs detected: "
-      );
 
       Serial.println(
-          ledCount
+          "Speed: 800 kHz"
+      );
+
+
+      Serial.println(
+          "Conversion: GRB -> BRG"
       );
 
 
@@ -376,25 +348,17 @@ private:
 public:
 
 
-  /*
-   * WLED Usermod setup.
-   */
+  // ==================================================
+  // SETUP
+  // ==================================================
 
   void setup() override {
-
-    /*
-     * GPIO25 as digital input.
-     */
 
     pinMode(
         PASSTHROUGH_INPUT_PIN,
         INPUT
     );
 
-
-    /*
-     * Startup message.
-     */
 
     Serial.println();
 
@@ -406,6 +370,7 @@ public:
         "Passthrough Usermod STARTED"
     );
 
+
     Serial.print(
         "Input GPIO: "
     );
@@ -414,30 +379,67 @@ public:
         PASSTHROUGH_INPUT_PIN
     );
 
+
     Serial.println(
         "RMT: LEGACY RX"
     );
+
 
     Serial.println(
         "Protocol: WS2811"
     );
 
-    Serial.println(
-        "Input order: GRB"
+
+    Serial.print(
+        "Physical LEDs: "
     );
 
     Serial.println(
-        "Output order: RGB"
+        PHYSICAL_LEDS
     );
+
+
+    Serial.print(
+        "WS2811 ICs: "
+    );
+
+    Serial.println(
+        PIXEL_COUNT
+    );
+
+
+    Serial.print(
+        "Frame bytes: "
+    );
+
+    Serial.println(
+        FRAME_BYTES
+    );
+
+
+    Serial.println(
+        "Speed: 800 kHz"
+    );
+
+
+    Serial.println(
+        "Input:  GRB"
+    );
+
+
+    Serial.println(
+        "Output: BRG"
+    );
+
 
     Serial.println(
         "================================"
     );
 
 
-    /*
-     * RMT configuration.
-     */
+    // ==================================================
+    // RMT CONFIGURATION
+    // ==================================================
 
     rmt_config_t config = {};
 
@@ -455,20 +457,12 @@ public:
         PASSTHROUGH_INPUT_PIN;
 
 
-    /*
-     * 80 MHz / 2
-     * = 40 MHz
-     */
-
     config.clk_div =
         RMT_CLK_DIV;
 
 
     /*
-     * ESP32 has 8 RMT memory blocks.
-     *
-     * Use all 8 for receiving
-     * longer LED frames.
+     * Use multiple RMT memory blocks.
      */
 
     config.mem_block_num = 8;
@@ -478,7 +472,7 @@ public:
 
 
     /*
-     * Enable input filter.
+     * Input filter.
      */
 
     config.rx_config.filter_en =
@@ -491,8 +485,7 @@ public:
 
 
     /*
-     * A WS2811 reset is normally
-     * longer than 50 us.
+     * Detect WS2811 reset.
      */
 
     config.rx_config
@@ -500,9 +493,9 @@ public:
         RMT_IDLE_THRESHOLD;
 
 
-    /*
-     * Configure RMT peripheral.
-     */
+    // ==================================================
+    // INSTALL RMT DRIVER
+    // ==================================================
 
     esp_err_t result =
         rmt_config(
@@ -510,10 +503,12 @@ public:
         );
 
 
-    if (result != ESP_OK) {
+    if (
+        result != ESP_OK
+    ) {
 
       Serial.print(
-          "ERROR: rmt_config = "
+          "ERROR rmt_config: "
       );
 
       Serial.println(
@@ -523,12 +518,6 @@ public:
       return;
     }
 
-
-    /*
-     * Install RMT driver.
-     *
-     * 8192 bytes ring buffer.
-     */
 
     result =
         rmt_driver_install(
@@ -538,10 +527,12 @@ public:
         );
 
 
-    if (result != ESP_OK) {
+    if (
+        result != ESP_OK
+    ) {
 
       Serial.print(
-          "ERROR: rmt_driver_install = "
+          "ERROR rmt_driver_install: "
       );
 
       Serial.println(
@@ -552,9 +543,9 @@ public:
     }
 
 
-    /*
-     * Get the ring buffer handle.
-     */
+    // ==================================================
+    // GET RING BUFFER
+    // ==================================================
 
     result =
         rmt_get_ringbuf_handle(
@@ -568,21 +559,17 @@ public:
         rmtRingBuffer == nullptr
     ) {
 
-      Serial.print(
-          "ERROR: RMT ring buffer = "
-      );
-
       Serial.println(
-          result
+          "ERROR: RMT ring buffer"
       );
 
       return;
     }
 
 
-    /*
-     * Start RMT receiver.
-     */
+    // ==================================================
+    // START RMT RX
+    // ==================================================
 
     result =
         rmt_rx_start(
@@ -591,10 +578,12 @@ public:
         );
 
 
-    if (result != ESP_OK) {
+    if (
+        result != ESP_OK
+    ) {
 
       Serial.print(
-          "ERROR: rmt_rx_start = "
+          "ERROR rmt_rx_start: "
       );
 
       Serial.println(
@@ -612,9 +601,11 @@ public:
         "RMT RX READY"
     );
 
+
     Serial.println(
         "Waiting for WS2811 DATA on GPIO25..."
     );
+
 
     Serial.println(
         "================================"
@@ -622,9 +613,9 @@ public:
   }
 
 
-  /*
-   * WLED main loop.
-   */
+  // ==================================================
+  // LOOP
+  // ==================================================
 
   void loop() override {
 
@@ -640,9 +631,9 @@ public:
 
 
     /*
-     * Do NOT block WLED.
+     * Non-blocking receive.
      *
-     * Timeout = 0.
+     * Important for reducing delay.
      */
 
     rmt_item32_t *items =
@@ -658,41 +649,58 @@ public:
       return;
 
 
-    /*
-     * Calculate number of
-     * RMT symbols received.
-     */
-
     size_t itemCount =
         receivedSize /
         sizeof(rmt_item32_t);
 
 
     /*
-     * Decode frame.
+     * Decode this chunk.
      */
 
-    processFrame(
+    decodeSymbols(
         items,
         itemCount
     );
 
 
     /*
-     * Return buffer to RMT.
+     * Return RMT memory.
      */
 
     vRingbufferReturnItem(
         rmtRingBuffer,
         (void *)items
     );
+
+
+    /*
+     * We expect:
+     *
+     * 20 IC × 3 bytes
+     *
+     * = 60 bytes
+     */
+
+    if (
+        frameBytes >= FRAME_BYTES
+    ) {
+
+      sendFrame();
+
+
+      /*
+       * Prepare for next frame.
+       */
+
+      frameBytes = 0;
+    }
   }
 
 
-  /*
-   * Show Usermod information
-   * in WLED Info page.
-   */
+  // ==================================================
+  // WLED INFO
+  // ==================================================
 
   void addToJsonInfo(
       JsonObject &root
@@ -709,22 +717,26 @@ public:
         PASSTHROUGH_INPUT_PIN;
 
 
-    info["status"] =
-        "WS2811 RX";
+    info["physical_leds"] =
+        PHYSICAL_LEDS;
 
 
-    info["rmt"] =
-        "Legacy";
+    info["ws2811_ics"] =
+        PIXEL_COUNT;
+
+
+    info["speed"] =
+        "800 kHz";
+
+
+    info["conversion"] =
+        "GRB -> BRG";
 
 
     info["frames"] =
         framesReceived;
   }
 
-
-  /*
-   * Unique Usermod ID.
-   */
 
   uint16_t getId() override {
 
@@ -733,17 +745,13 @@ public:
 };
 
 
-/*
- * Create Usermod instance.
- */
+// ==================================================
+// REGISTER USERMOD
+// ==================================================
 
 static PassthroughUsermod
 passthroughUsermod;
 
-
-/*
- * Register with WLED.
- */
 
 REGISTER_USERMOD(
     passthroughUsermod
