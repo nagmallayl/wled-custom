@@ -1,4 +1,3 @@
-```cpp
 #include "wled.h"
 #include "driver/rmt.h"
 
