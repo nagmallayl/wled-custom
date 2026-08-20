@@ -5,22 +5,26 @@
 #include "esp_wifi.h"
 
 // ======================================================
-// WLED ESP-NOW RECEIVER TEST V2
+// WLED ESP-NOW RECEIVER V3
 //
 // WLED 16.0.0
 // ESP32 Classic / GL-C-016WL-D
 //
-// IMPORTANT FIX:
-// ESP-NOW initialization is delayed until
-// WLED Wi-Fi is actually CONNECTED.
+// ESP-NOW RX
+// 38 WS2811 IC
+// 114 decoded bytes
 //
-// RECEIVE ONLY.
-// NO LED OUTPUT YET.
+// OUTPUT:
+// WLED pixels 0..37
+// GPIO16 / I2S
+//
+// Input packet color order: G R B
+// Output mapping used here: B R G
 // ======================================================
 
 
 // ======================================================
-// FRAME CONFIG
+// CONFIG
 // ======================================================
 
 #define EXPECTED_ICS 38
@@ -28,14 +32,18 @@
 #define FRAME_BYTES \
   (EXPECTED_ICS * 3)
 
-
-// ======================================================
-// PACKET FORMAT
-// ======================================================
-
 #define PACKET_MAGIC   0x2811
 #define PACKET_VERSION 1
 
+#define SIGNAL_TIMEOUT_MS 1500
+#define REALTIME_LOCK_MS  1000
+
+#define RX_QUEUE_LENGTH 8
+
+
+// ======================================================
+// PACKET
+// ======================================================
 
 struct __attribute__((packed))
 LedPacket
@@ -62,13 +70,9 @@ LedPacket
 // QUEUE
 // ======================================================
 
-#define RX_QUEUE_LENGTH 12
-
-
 struct RxQueueItem
 {
   LedPacket packet;
-
   uint8_t senderMac[6];
 };
 
@@ -78,21 +82,36 @@ static QueueHandle_t rxQueue =
 
 
 // ======================================================
-// ESP-NOW STATE
+// LAST FRAME
+// ======================================================
+
+static uint8_t lastGoodFrame[
+  FRAME_BYTES
+];
+
+static volatile bool newFrameReady =
+  false;
+
+
+// ======================================================
+// STATE
 // ======================================================
 
 static bool espNowReady =
   false;
 
-static bool espNowInitAttempted =
+static bool realtimeActive =
   false;
 
 static uint32_t lastInitAttemptMs =
   0;
 
+static uint32_t lastPacketMillis =
+  0;
+
 
 // ======================================================
-// STATISTICS
+// STATS
 // ======================================================
 
 static volatile uint32_t packetsReceived =
@@ -111,6 +130,8 @@ static uint32_t packetsProcessed =
 static uint32_t packetsGood =
   0;
 
+static uint32_t framesShown =
+  0;
 
 static uint32_t badMagic =
   0;
@@ -124,11 +145,6 @@ static uint32_t badIcCount =
 static uint32_t badCRC =
   0;
 
-
-// ======================================================
-// FRAME SEQUENCE
-// ======================================================
-
 static uint32_t lastFrameId =
   0;
 
@@ -141,44 +157,12 @@ static uint32_t duplicateFrames =
 static uint32_t outOfOrderFrames =
   0;
 
-
-// ======================================================
-// LAST GOOD FRAME
-// ======================================================
-
-static uint8_t lastGoodFrame[
-  FRAME_BYTES
-];
-
-static uint32_t lastGoodFrameId =
-  0;
-
-static uint32_t lastTxMicros =
-  0;
-
-
-static uint8_t lastSenderMac[6] =
-{
-  0, 0, 0, 0, 0, 0
-};
-
-
-// ======================================================
-// TIMING
-// ======================================================
-
-static uint32_t lastPacketMillis =
-  0;
-
 static uint32_t lastStatusMillis =
   0;
 
-static uint32_t lastFramePrintMillis =
-  0;
-
 
 // ======================================================
-// CRC16 / CCITT
+// CRC16
 // ======================================================
 
 static uint16_t calculateCRC16(
@@ -228,9 +212,7 @@ static uint16_t calculateCRC16(
 
 
 // ======================================================
-// ESP-NOW RECEIVE CALLBACK
-//
-// Keep callback very short.
+// ESP-NOW CALLBACK
 // ======================================================
 
 static void onEspNowReceive(
@@ -247,7 +229,6 @@ static void onEspNowReceive(
   )
   {
     badLength++;
-
     return;
   }
 
@@ -257,7 +238,6 @@ static void onEspNowReceive(
   )
   {
     queueDrops++;
-
     return;
   }
 
@@ -279,16 +259,12 @@ static void onEspNowReceive(
   );
 
 
-  BaseType_t result =
+  if (
     xQueueSend(
       rxQueue,
       &item,
       0
-    );
-
-
-  if (
-    result != pdTRUE
+    ) != pdTRUE
   )
   {
     queueDrops++;
@@ -340,9 +316,6 @@ static bool createRxQueue()
 
 // ======================================================
 // START ESP-NOW
-//
-// IMPORTANT:
-// Call ONLY after Wi-Fi is connected.
 // ======================================================
 
 static bool startEspNow()
@@ -367,59 +340,32 @@ static bool startEspNow()
   Serial.println();
 
   Serial.println(
-    "Wi-Fi connected -> starting ESP-NOW..."
+    "Wi-Fi ready -> starting ESP-NOW..."
   );
 
 
-  // ====================================================
-  // DIAGNOSTIC CHANNEL
-  // ====================================================
-
-  uint8_t primaryChannel =
+  uint8_t channel =
     0;
 
 
-  wifi_second_chan_t secondaryChannel =
+  wifi_second_chan_t secondary =
     WIFI_SECOND_CHAN_NONE;
 
 
-  esp_err_t channelErr =
-    esp_wifi_get_channel(
-      &primaryChannel,
-      &secondaryChannel
-    );
+  esp_wifi_get_channel(
+    &channel,
+    &secondary
+  );
 
 
-  if (
-    channelErr ==
-    ESP_OK
-  )
-  {
-    Serial.print(
-      "Wi-Fi Channel: "
-    );
+  Serial.print(
+    "Wi-Fi Channel: "
+  );
 
-    Serial.println(
-      primaryChannel
-    );
-  }
-  else
-  {
-    Serial.print(
-      "Wi-Fi channel read error: "
-    );
+  Serial.println(
+    channel
+  );
 
-    Serial.println(
-      esp_err_to_name(
-        channelErr
-      )
-    );
-  }
-
-
-  // ====================================================
-  // ESP-NOW INIT
-  // ====================================================
 
   esp_err_t err =
     esp_now_init();
@@ -441,10 +387,6 @@ static bool startEspNow()
   }
 
 
-  // ====================================================
-  // CALLBACK
-  // ====================================================
-
   err =
     esp_now_register_recv_cb(
       onEspNowReceive
@@ -463,9 +405,7 @@ static bool startEspNow()
       esp_err_to_name(err)
     );
 
-
     esp_now_deinit();
-
 
     return false;
   }
@@ -485,14 +425,13 @@ static bool startEspNow()
 
 
 // ======================================================
-// SEQUENCE CHECK
+// FRAME SEQUENCE
 // ======================================================
 
 static void processFrameSequence(
   uint32_t frameId
 )
 {
-  // First frame.
   if (
     lastFrameId == 0
   )
@@ -504,7 +443,6 @@ static void processFrameSequence(
   }
 
 
-  // Expected next frame.
   if (
     frameId ==
     lastFrameId + 1
@@ -517,7 +455,6 @@ static void processFrameSequence(
   }
 
 
-  // Duplicate.
   if (
     frameId ==
     lastFrameId
@@ -529,7 +466,6 @@ static void processFrameSequence(
   }
 
 
-  // Newer frame with missing frames.
   if (
     frameId >
     lastFrameId + 1
@@ -548,13 +484,12 @@ static void processFrameSequence(
   }
 
 
-  // Older frame.
   outOfOrderFrames++;
 }
 
 
 // ======================================================
-// PROCESS PACKET
+// VALIDATE PACKET
 // ======================================================
 
 static void processReceivedPacket(
@@ -568,24 +503,15 @@ static void processReceivedPacket(
     item.packet;
 
 
-  // ====================================================
-  // MAGIC
-  // ====================================================
-
   if (
     packet.magic !=
     PACKET_MAGIC
   )
   {
     badMagic++;
-
     return;
   }
 
-
-  // ====================================================
-  // VERSION
-  // ====================================================
 
   if (
     packet.version !=
@@ -593,14 +519,9 @@ static void processReceivedPacket(
   )
   {
     badVersion++;
-
     return;
   }
 
-
-  // ====================================================
-  // IC COUNT
-  // ====================================================
 
   if (
     packet.icCount !=
@@ -608,16 +529,11 @@ static void processReceivedPacket(
   )
   {
     badIcCount++;
-
     return;
   }
 
 
-  // ====================================================
-  // CRC
-  // ====================================================
-
-  uint16_t calculatedCRC =
+  uint16_t crc =
     calculateCRC16(
       (const uint8_t *)&packet,
       sizeof(LedPacket) -
@@ -626,19 +542,13 @@ static void processReceivedPacket(
 
 
   if (
-    calculatedCRC !=
-    packet.crc
+    crc != packet.crc
   )
   {
     badCRC++;
-
     return;
   }
 
-
-  // ====================================================
-  // GOOD PACKET
-  // ====================================================
 
   packetsGood++;
 
@@ -655,19 +565,8 @@ static void processReceivedPacket(
   );
 
 
-  memcpy(
-    lastSenderMac,
-    item.senderMac,
-    6
-  );
-
-
-  lastGoodFrameId =
-    packet.frameId;
-
-
-  lastTxMicros =
-    packet.txMicros;
+  newFrameReady =
+    true;
 
 
   lastPacketMillis =
@@ -708,193 +607,141 @@ static void processRxQueue()
 
 
 // ======================================================
-// PRINT MAC
+// APPLY FRAME TO WLED
 // ======================================================
 
-static void printMac(
-  const uint8_t *mac
-)
-{
-  for (
-    uint8_t i = 0;
-    i < 6;
-    i++
-  )
-  {
-    if (
-      i > 0
-    )
-    {
-      Serial.print(
-        ":"
-      );
-    }
-
-
-    if (
-      mac[i] < 16
-    )
-    {
-      Serial.print(
-        "0"
-      );
-    }
-
-
-    Serial.print(
-      mac[i],
-      HEX
-    );
-  }
-}
-
-
-// ======================================================
-// PRINT IC
-// ======================================================
-
-static void printOneIC(
-  uint8_t index
-)
-{
-  uint16_t p =
-    index * 3;
-
-
-  Serial.print(
-    "IC"
-  );
-
-
-  Serial.print(
-    index + 1
-  );
-
-
-  Serial.print(
-    ": G="
-  );
-
-
-  Serial.print(
-    lastGoodFrame[
-      p + 0
-    ]
-  );
-
-
-  Serial.print(
-    " R="
-  );
-
-
-  Serial.print(
-    lastGoodFrame[
-      p + 1
-    ]
-  );
-
-
-  Serial.print(
-    " B="
-  );
-
-
-  Serial.println(
-    lastGoodFrame[
-      p + 2
-    ]
-  );
-}
-
-
-// ======================================================
-// PRINT FRAME SAMPLE
-// ======================================================
-
-static void printFrameSample()
+static void applyFrameToWLED()
 {
   if (
-    packetsGood == 0
+    !newFrameReady
   )
   {
     return;
   }
 
 
-  Serial.println();
+  // ----------------------------------------------------
+  // Lock WLED in realtime mode
+  // ----------------------------------------------------
 
-  Serial.println(
-    "========== ESP-NOW RX FRAME =========="
+  realtimeLock(
+    REALTIME_LOCK_MS,
+    REALTIME_MODE_UDP
   );
 
 
-  Serial.print(
-    "Frame ID: "
-  );
+  realtimeActive =
+    true;
 
 
-  Serial.println(
-    lastGoodFrameId
-  );
+  // ----------------------------------------------------
+  // Incoming:
+  //
+  // G R B
+  //
+  // Output mapping:
+  //
+  // B R G
+  //
+  // ----------------------------------------------------
+
+  for (
+    uint16_t i = 0;
+    i < EXPECTED_ICS;
+    i++
+  )
+  {
+    uint16_t p =
+      i * 3;
 
 
-  Serial.print(
-    "Sender MAC: "
-  );
+    uint8_t inputG =
+      lastGoodFrame[
+        p + 0
+      ];
 
 
-  printMac(
-    lastSenderMac
-  );
+    uint8_t inputR =
+      lastGoodFrame[
+        p + 1
+      ];
 
 
-  Serial.println();
+    uint8_t inputB =
+      lastGoodFrame[
+        p + 2
+      ];
 
 
-  Serial.print(
-    "TX micros: "
-  );
+    strip.setPixelColor(
+      i,
+
+      inputB,
+
+      inputR,
+
+      inputG
+    );
+  }
 
 
-  Serial.println(
-    lastTxMicros
-  );
+  // ----------------------------------------------------
+  // Actual LED output
+  //
+  // GPIO16 must be configured as I2S in WLED.
+  // ----------------------------------------------------
+
+  strip.show();
 
 
-  printOneIC(0);
-  printOneIC(1);
-  printOneIC(2);
+  framesShown++;
 
 
-  Serial.println(
-    "..."
-  );
-
-
-  printOneIC(
-    EXPECTED_ICS - 3
-  );
-
-
-  printOneIC(
-    EXPECTED_ICS - 2
-  );
-
-
-  printOneIC(
-    EXPECTED_ICS - 1
-  );
-
-
-  Serial.println(
-    "======================================"
-  );
+  newFrameReady =
+    false;
 }
 
 
 // ======================================================
-// PRINT STATUS
+// SIGNAL TIMEOUT
+// ======================================================
+
+static void updateRealtimeTimeout()
+{
+  if (
+    !realtimeActive
+  )
+  {
+    return;
+  }
+
+
+  if (
+    millis() -
+      lastPacketMillis >
+      SIGNAL_TIMEOUT_MS
+  )
+  {
+    realtimeActive =
+      false;
+
+
+    newFrameReady =
+      false;
+
+
+    exitRealtime();
+
+
+    Serial.println(
+      "ESP-NOW signal lost -> WLED effects resumed"
+    );
+  }
+}
+
+
+// ======================================================
+// STATUS
 // ======================================================
 
 static void printStatus()
@@ -903,7 +750,73 @@ static void printStatus()
 
 
   Serial.print(
-    "WiFi: "
+    "RX: "
+  );
+
+  Serial.print(
+    packetsReceived
+  );
+
+
+  Serial.print(
+    "  Good: "
+  );
+
+  Serial.print(
+    packetsGood
+  );
+
+
+  Serial.print(
+    "  Shown: "
+  );
+
+  Serial.print(
+    framesShown
+  );
+
+
+  Serial.print(
+    "  Lost: "
+  );
+
+  Serial.print(
+    lostFrames
+  );
+
+
+  Serial.print(
+    "  CRCBad: "
+  );
+
+  Serial.print(
+    badCRC
+  );
+
+
+  Serial.print(
+    "  QueueDrop: "
+  );
+
+  Serial.print(
+    queueDrops
+  );
+
+
+  Serial.print(
+    "  Mode: "
+  );
+
+
+  Serial.print(
+    realtimeActive ?
+    "REALTIME" :
+    "WLED"
+  );
+
+
+  Serial.print(
+    "  WiFi: "
   );
 
 
@@ -917,33 +830,18 @@ static void printStatus()
     );
 
 
-    Serial.print(
-      " RSSI="
-    );
-
-
-    Serial.print(
-      WiFi.RSSI()
-    );
-
-
-    Serial.print(
-      "dBm"
-    );
-
-
-    uint8_t primaryChannel =
+    uint8_t channel =
       0;
 
 
-    wifi_second_chan_t secondaryChannel =
+    wifi_second_chan_t secondary =
       WIFI_SECOND_CHAN_NONE;
 
 
     if (
       esp_wifi_get_channel(
-        &primaryChannel,
-        &secondaryChannel
+        &channel,
+        &secondary
       ) == ESP_OK
     )
     {
@@ -951,9 +849,8 @@ static void printStatus()
         " CH="
       );
 
-
       Serial.print(
-        primaryChannel
+        channel
       );
     }
   }
@@ -965,146 +862,7 @@ static void printStatus()
   }
 
 
-  Serial.print(
-    "  ESP-NOW: "
-  );
-
-
-  Serial.println(
-    espNowReady ?
-    "READY" :
-    "WAITING"
-  );
-
-
-  Serial.print(
-    "ESP RX: "
-  );
-
-
-  Serial.print(
-    packetsReceived
-  );
-
-
-  Serial.print(
-    "  Processed: "
-  );
-
-
-  Serial.print(
-    packetsProcessed
-  );
-
-
-  Serial.print(
-    "  Good: "
-  );
-
-
-  Serial.print(
-    packetsGood
-  );
-
-
-  Serial.print(
-    "  BadLen: "
-  );
-
-
-  Serial.print(
-    badLength
-  );
-
-
-  Serial.print(
-    "  QueueDrop: "
-  );
-
-
-  Serial.println(
-    queueDrops
-  );
-
-
-  Serial.print(
-    "CRC Bad: "
-  );
-
-
-  Serial.print(
-    badCRC
-  );
-
-
-  Serial.print(
-    "  Magic Bad: "
-  );
-
-
-  Serial.print(
-    badMagic
-  );
-
-
-  Serial.print(
-    "  Version Bad: "
-  );
-
-
-  Serial.print(
-    badVersion
-  );
-
-
-  Serial.print(
-    "  IC Bad: "
-  );
-
-
-  Serial.println(
-    badIcCount
-  );
-
-
-  Serial.print(
-    "Last Frame: "
-  );
-
-
-  Serial.print(
-    lastGoodFrameId
-  );
-
-
-  Serial.print(
-    "  Lost: "
-  );
-
-
-  Serial.print(
-    lostFrames
-  );
-
-
-  Serial.print(
-    "  Duplicate: "
-  );
-
-
-  Serial.print(
-    duplicateFrames
-  );
-
-
-  Serial.print(
-    "  OutOfOrder: "
-  );
-
-
-  Serial.println(
-    outOfOrderFrames
-  );
+  Serial.println();
 }
 
 
@@ -1112,15 +870,11 @@ static void printStatus()
 // USERMOD
 // ======================================================
 
-class EspNowReceiverUsermod :
+class EspNowLedReceiverUsermod :
   public Usermod
 {
 
 public:
-
-  // ====================================================
-  // SETUP
-  // ====================================================
 
   void setup() override
   {
@@ -1139,7 +893,7 @@ public:
 
 
     Serial.println(
-      "WLED ESP-NOW RECEIVER TEST V2"
+      "WLED ESP-NOW LED RECEIVER V3"
     );
 
 
@@ -1162,7 +916,6 @@ public:
       "Expected ICs: "
     );
 
-
     Serial.println(
       EXPECTED_ICS
     );
@@ -1172,24 +925,28 @@ public:
       "Frame bytes: "
     );
 
-
     Serial.println(
       FRAME_BYTES
     );
 
 
-    Serial.print(
-      "ESP-NOW packet bytes: "
+    Serial.println(
+      "Output: WLED pixels 0-37"
     );
 
 
     Serial.println(
-      sizeof(LedPacket)
+      "GPIO16: I2S"
     );
 
 
     Serial.println(
-      "LED output: DISABLED"
+      "Input order: GRB"
+    );
+
+
+    Serial.println(
+      "Output mapping: BRG"
     );
 
 
@@ -1203,20 +960,12 @@ public:
     );
 
 
-    // ==================================================
-    // ONLY CREATE QUEUE HERE.
-    //
-    // DO NOT call esp_now_init() yet.
-    // ==================================================
+    createRxQueue();
 
-    if (
-      createRxQueue()
-    )
-    {
-      Serial.println(
-        "Waiting for WLED Wi-Fi..."
-      );
-    }
+
+    Serial.println(
+      "Waiting for WLED Wi-Fi..."
+    );
 
 
     Serial.println(
@@ -1225,31 +974,22 @@ public:
   }
 
 
-  // ====================================================
-  // LOOP
-  // ====================================================
-
   void loop() override
   {
     uint32_t now =
       millis();
 
 
-    // ==================================================
-    // DELAY ESP-NOW INITIALIZATION UNTIL WIFI EXISTS
-    // ==================================================
+    // --------------------------------------------------
+    // Initialize ESP-NOW only after WLED Wi-Fi is ready.
+    // --------------------------------------------------
 
     if (
       !espNowReady &&
       WiFi.status() ==
-        WL_CONNECTED
+      WL_CONNECTED
     )
     {
-      /*
-       * Wait at least ~2 seconds after WLED boot/network
-       * startup before first initialization attempt.
-       */
-
       if (
         now > 2000 &&
         now -
@@ -1261,70 +1001,36 @@ public:
           now;
 
 
-        Serial.println();
-
-        Serial.println(
-          "WLED Wi-Fi is ready."
-        );
-
-
-        Serial.println(
-          "Initializing ESP-NOW now..."
-        );
-
-
-        if (
-          startEspNow()
-        )
-        {
-          Serial.println(
-            "ESP-NOW initialization SUCCESS"
-          );
-        }
-        else
-        {
-          Serial.println(
-            "ESP-NOW initialization FAILED"
-          );
-        }
+        startEspNow();
       }
     }
 
 
-    // ==================================================
-    // PROCESS RECEIVED PACKETS
-    // ==================================================
+    // --------------------------------------------------
+    // Receive packets.
+    // --------------------------------------------------
 
     if (
       espNowReady
     )
     {
       processRxQueue();
+
+
+      applyFrameToWLED();
     }
 
 
-    // ==================================================
-    // FRAME SAMPLE
-    // ==================================================
+    // --------------------------------------------------
+    // Return control to WLED if transmitter disappears.
+    // --------------------------------------------------
 
-    if (
-      packetsGood > 0 &&
-      now -
-        lastFramePrintMillis >=
-        5000
-    )
-    {
-      lastFramePrintMillis =
-        now;
+    updateRealtimeTimeout();
 
 
-      printFrameSample();
-    }
-
-
-    // ==================================================
-    // STATUS
-    // ==================================================
+    // --------------------------------------------------
+    // Diagnostics
+    // --------------------------------------------------
 
     if (
       now -
@@ -1341,10 +1047,6 @@ public:
   }
 
 
-  // ====================================================
-  // INFO
-  // ====================================================
-
   void addToJsonInfo(
     JsonObject &root
   ) override
@@ -1352,7 +1054,7 @@ public:
     JsonObject info =
       root["u"]
       .createNestedObject(
-        "ESP-NOW Receiver"
+        "ESP-NOW LED RX"
       );
 
 
@@ -1368,26 +1070,30 @@ public:
       packetsGood;
 
 
-    info["crc_bad"] =
-      badCRC;
+    info["shown"] =
+      framesShown;
 
 
     info["lost"] =
       lostFrames;
 
 
+    info["crc_bad"] =
+      badCRC;
+
+
     info["queue_drop"] =
       queueDrops;
 
 
-    info["frame"] =
-      lastGoodFrameId;
+    info["realtime"] =
+      realtimeActive;
   }
 
 
   uint16_t getId() override
   {
-    return 0x5055;
+    return 0x5056;
   }
 };
 
@@ -1396,10 +1102,10 @@ public:
 // REGISTER
 // ======================================================
 
-static EspNowReceiverUsermod
-espNowReceiverUsermod;
+static EspNowLedReceiverUsermod
+espNowLedReceiverUsermod;
 
 
 REGISTER_USERMOD(
-  espNowReceiverUsermod
+  espNowLedReceiverUsermod
 );
