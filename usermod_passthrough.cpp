@@ -5,20 +5,17 @@
 #include "esp_wifi.h"
 
 // ======================================================
-// WLED ESP-NOW RECEIVER TEST V1
+// WLED ESP-NOW RECEIVER TEST V2
 //
 // WLED 16.0.0
 // ESP32 Classic / GL-C-016WL-D
 //
-// Receives:
-// 38 WS2811 IC
-// 114 decoded color bytes
-// 128-byte ESP-NOW packet
+// IMPORTANT FIX:
+// ESP-NOW initialization is delayed until
+// WLED Wi-Fi is actually CONNECTED.
 //
-// CURRENT TEST:
-// ESP-NOW RECEIVE ONLY
-//
-// NO LED OUTPUT FROM RECEIVED DATA YET.
+// RECEIVE ONLY.
+// NO LED OUTPUT YET.
 // ======================================================
 
 
@@ -34,8 +31,6 @@
 
 // ======================================================
 // PACKET FORMAT
-//
-// MUST MATCH TRANSMITTER EXACTLY
 // ======================================================
 
 #define PACKET_MAGIC   0x2811
@@ -65,14 +60,9 @@ LedPacket
 
 // ======================================================
 // QUEUE
-//
-// Callback receives packets quickly.
-// Actual validation/printing happens in WLED loop.
-//
-// 8 packets × 128 bytes ≈ 1 KB.
 // ======================================================
 
-#define RX_QUEUE_LENGTH 8
+#define RX_QUEUE_LENGTH 12
 
 
 struct RxQueueItem
@@ -88,35 +78,40 @@ static QueueHandle_t rxQueue =
 
 
 // ======================================================
+// ESP-NOW STATE
+// ======================================================
+
+static bool espNowReady =
+  false;
+
+static bool espNowInitAttempted =
+  false;
+
+static uint32_t lastInitAttemptMs =
+  0;
+
+
+// ======================================================
 // STATISTICS
 // ======================================================
 
-// Every ESP-NOW callback received.
 static volatile uint32_t packetsReceived =
   0;
 
-
-// Wrong packet length.
 static volatile uint32_t badLength =
   0;
 
-
-// Queue was full.
 static volatile uint32_t queueDrops =
   0;
 
 
-// Packets processed from queue.
 static uint32_t packetsProcessed =
   0;
 
-
-// Valid packets.
 static uint32_t packetsGood =
   0;
 
 
-// Validation errors.
 static uint32_t badMagic =
   0;
 
@@ -130,7 +125,10 @@ static uint32_t badCRC =
   0;
 
 
-// Sequence diagnostics.
+// ======================================================
+// FRAME SEQUENCE
+// ======================================================
+
 static uint32_t lastFrameId =
   0;
 
@@ -144,7 +142,10 @@ static uint32_t outOfOrderFrames =
   0;
 
 
-// Last valid frame.
+// ======================================================
+// LAST GOOD FRAME
+// ======================================================
+
 static uint8_t lastGoodFrame[
   FRAME_BYTES
 ];
@@ -156,14 +157,16 @@ static uint32_t lastTxMicros =
   0;
 
 
-// Sender information.
 static uint8_t lastSenderMac[6] =
 {
   0, 0, 0, 0, 0, 0
 };
 
 
-// Timing.
+// ======================================================
+// TIMING
+// ======================================================
+
 static uint32_t lastPacketMillis =
   0;
 
@@ -174,15 +177,8 @@ static uint32_t lastFramePrintMillis =
   0;
 
 
-// ESP-NOW state.
-static bool espNowReady =
-  false;
-
-
 // ======================================================
 // CRC16 / CCITT
-//
-// MUST MATCH TRANSMITTER.
 // ======================================================
 
 static uint16_t calculateCRC16(
@@ -234,9 +230,7 @@ static uint16_t calculateCRC16(
 // ======================================================
 // ESP-NOW RECEIVE CALLBACK
 //
-// Keep this callback very short.
-//
-// Arduino-ESP32 2.x / IDF 4.4 callback signature.
+// Keep callback very short.
 // ======================================================
 
 static void onEspNowReceive(
@@ -285,10 +279,6 @@ static void onEspNowReceive(
   );
 
 
-  /*
-   * No blocking inside Wi-Fi callback.
-   */
-
   BaseType_t result =
     xQueueSend(
       rxQueue,
@@ -307,21 +297,18 @@ static void onEspNowReceive(
 
 
 // ======================================================
-// SETUP ESP-NOW
+// CREATE QUEUE
 // ======================================================
 
-static bool setupEspNowReceiver()
+static bool createRxQueue()
 {
-  Serial.println();
+  if (
+    rxQueue != nullptr
+  )
+  {
+    return true;
+  }
 
-  Serial.println(
-    "Starting ESP-NOW receiver..."
-  );
-
-
-  // ----------------------------------------------------
-  // Create packet queue
-  // ----------------------------------------------------
 
   rxQueue =
     xQueueCreate(
@@ -342,9 +329,97 @@ static bool setupEspNowReceiver()
   }
 
 
-  // ----------------------------------------------------
-  // Initialize ESP-NOW
-  // ----------------------------------------------------
+  Serial.println(
+    "RX QUEUE READY"
+  );
+
+
+  return true;
+}
+
+
+// ======================================================
+// START ESP-NOW
+//
+// IMPORTANT:
+// Call ONLY after Wi-Fi is connected.
+// ======================================================
+
+static bool startEspNow()
+{
+  if (
+    espNowReady
+  )
+  {
+    return true;
+  }
+
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  )
+  {
+    return false;
+  }
+
+
+  Serial.println();
+
+  Serial.println(
+    "Wi-Fi connected -> starting ESP-NOW..."
+  );
+
+
+  // ====================================================
+  // DIAGNOSTIC CHANNEL
+  // ====================================================
+
+  uint8_t primaryChannel =
+    0;
+
+
+  wifi_second_chan_t secondaryChannel =
+    WIFI_SECOND_CHAN_NONE;
+
+
+  esp_err_t channelErr =
+    esp_wifi_get_channel(
+      &primaryChannel,
+      &secondaryChannel
+    );
+
+
+  if (
+    channelErr ==
+    ESP_OK
+  )
+  {
+    Serial.print(
+      "Wi-Fi Channel: "
+    );
+
+    Serial.println(
+      primaryChannel
+    );
+  }
+  else
+  {
+    Serial.print(
+      "Wi-Fi channel read error: "
+    );
+
+    Serial.println(
+      esp_err_to_name(
+        channelErr
+      )
+    );
+  }
+
+
+  // ====================================================
+  // ESP-NOW INIT
+  // ====================================================
 
   esp_err_t err =
     esp_now_init();
@@ -366,9 +441,9 @@ static bool setupEspNowReceiver()
   }
 
 
-  // ----------------------------------------------------
-  // Register RX callback
-  // ----------------------------------------------------
+  // ====================================================
+  // CALLBACK
+  // ====================================================
 
   err =
     esp_now_register_recv_cb(
@@ -381,12 +456,16 @@ static bool setupEspNowReceiver()
   )
   {
     Serial.print(
-      "ESP-NOW RX CALLBACK ERROR: "
+      "ESP-NOW CALLBACK ERROR: "
     );
 
     Serial.println(
       esp_err_to_name(err)
     );
+
+
+    esp_now_deinit();
+
 
     return false;
   }
@@ -413,7 +492,7 @@ static void processFrameSequence(
   uint32_t frameId
 )
 {
-  // First packet.
+  // First frame.
   if (
     lastFrameId == 0
   )
@@ -425,7 +504,7 @@ static void processFrameSequence(
   }
 
 
-  // Normal next packet.
+  // Expected next frame.
   if (
     frameId ==
     lastFrameId + 1
@@ -450,7 +529,7 @@ static void processFrameSequence(
   }
 
 
-  // Newer packet with gap.
+  // Newer frame with missing frames.
   if (
     frameId >
     lastFrameId + 1
@@ -469,13 +548,13 @@ static void processFrameSequence(
   }
 
 
-  // Older packet.
+  // Older frame.
   outOfOrderFrames++;
 }
 
 
 // ======================================================
-// PROCESS ONE PACKET
+// PROCESS PACKET
 // ======================================================
 
 static void processReceivedPacket(
@@ -558,7 +637,7 @@ static void processReceivedPacket(
 
 
   // ====================================================
-  // VALID FRAME
+  // GOOD PACKET
   // ====================================================
 
   packetsGood++;
@@ -612,11 +691,6 @@ static void processRxQueue()
 
   RxQueueItem item;
 
-
-  /*
-   * Process all packets currently waiting,
-   * but never block WLED.
-   */
 
   while (
     xQueueReceive(
@@ -676,7 +750,7 @@ static void printMac(
 
 
 // ======================================================
-// PRINT ONE IC
+// PRINT IC
 // ======================================================
 
 static void printOneIC(
@@ -766,7 +840,7 @@ static void printFrameSample()
 
 
   Serial.print(
-    "Sender: "
+    "Sender MAC: "
   );
 
 
@@ -829,6 +903,81 @@ static void printStatus()
 
 
   Serial.print(
+    "WiFi: "
+  );
+
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  )
+  {
+    Serial.print(
+      "CONNECTED"
+    );
+
+
+    Serial.print(
+      " RSSI="
+    );
+
+
+    Serial.print(
+      WiFi.RSSI()
+    );
+
+
+    Serial.print(
+      "dBm"
+    );
+
+
+    uint8_t primaryChannel =
+      0;
+
+
+    wifi_second_chan_t secondaryChannel =
+      WIFI_SECOND_CHAN_NONE;
+
+
+    if (
+      esp_wifi_get_channel(
+        &primaryChannel,
+        &secondaryChannel
+      ) == ESP_OK
+    )
+    {
+      Serial.print(
+        " CH="
+      );
+
+
+      Serial.print(
+        primaryChannel
+      );
+    }
+  }
+  else
+  {
+    Serial.print(
+      "DISCONNECTED"
+    );
+  }
+
+
+  Serial.print(
+    "  ESP-NOW: "
+  );
+
+
+  Serial.println(
+    espNowReady ?
+    "READY" :
+    "WAITING"
+  );
+
+
+  Serial.print(
     "ESP RX: "
   );
 
@@ -873,12 +1022,9 @@ static void printStatus()
   );
 
 
-  Serial.print(
+  Serial.println(
     queueDrops
   );
-
-
-  Serial.println();
 
 
   Serial.print(
@@ -959,79 +1105,6 @@ static void printStatus()
   Serial.println(
     outOfOrderFrames
   );
-
-
-  Serial.print(
-    "WiFi: "
-  );
-
-
-  if (
-    WiFi.status() ==
-    WL_CONNECTED
-  )
-  {
-    Serial.print(
-      "CONNECTED"
-    );
-
-
-    Serial.print(
-      " RSSI="
-    );
-
-
-    Serial.print(
-      WiFi.RSSI()
-    );
-
-
-    Serial.print(
-      "dBm"
-    );
-
-
-    uint8_t primaryChannel =
-      0;
-
-
-    wifi_second_chan_t secondChannel =
-      WIFI_SECOND_CHAN_NONE;
-
-
-    esp_wifi_get_channel(
-      &primaryChannel,
-      &secondChannel
-    );
-
-
-    Serial.print(
-      " CH="
-    );
-
-
-    Serial.print(
-      primaryChannel
-    );
-  }
-  else
-  {
-    Serial.print(
-      "DISCONNECTED"
-    );
-  }
-
-
-  Serial.print(
-    "  ESP-NOW: "
-  );
-
-
-  Serial.println(
-    espNowReady ?
-    "READY" :
-    "FAILED"
-  );
 }
 
 
@@ -1066,7 +1139,7 @@ public:
 
 
     Serial.println(
-      "WLED ESP-NOW RECEIVER TEST V1"
+      "WLED ESP-NOW RECEIVER TEST V2"
     );
 
 
@@ -1116,17 +1189,12 @@ public:
 
 
     Serial.println(
-      "LED output from ESP-NOW: DISABLED"
+      "LED output: DISABLED"
     );
 
 
     Serial.println(
-      "CRC validation: ENABLED"
-    );
-
-
-    Serial.println(
-      "Sequence tracking: ENABLED"
+      "ESP-NOW init: WAIT FOR WIFI"
     );
 
 
@@ -1135,25 +1203,18 @@ public:
     );
 
 
-    /*
-     * WLED itself handles Wi-Fi connection.
-     *
-     * Do not call WiFi.begin() here.
-     */
-
+    // ==================================================
+    // ONLY CREATE QUEUE HERE.
+    //
+    // DO NOT call esp_now_init() yet.
+    // ==================================================
 
     if (
-      setupEspNowReceiver()
+      createRxQueue()
     )
     {
       Serial.println(
-        "Receiver setup complete"
-      );
-    }
-    else
-    {
-      Serial.println(
-        "Receiver setup FAILED"
+        "Waiting for WLED Wi-Fi..."
       );
     }
 
@@ -1170,22 +1231,87 @@ public:
 
   void loop() override
   {
-    processRxQueue();
-
-
     uint32_t now =
       millis();
 
 
-    // --------------------------------------------------
-    // Print frame sample every 5 seconds.
-    // --------------------------------------------------
+    // ==================================================
+    // DELAY ESP-NOW INITIALIZATION UNTIL WIFI EXISTS
+    // ==================================================
+
+    if (
+      !espNowReady &&
+      WiFi.status() ==
+        WL_CONNECTED
+    )
+    {
+      /*
+       * Wait at least ~2 seconds after WLED boot/network
+       * startup before first initialization attempt.
+       */
+
+      if (
+        now > 2000 &&
+        now -
+          lastInitAttemptMs >=
+          3000
+      )
+      {
+        lastInitAttemptMs =
+          now;
+
+
+        Serial.println();
+
+        Serial.println(
+          "WLED Wi-Fi is ready."
+        );
+
+
+        Serial.println(
+          "Initializing ESP-NOW now..."
+        );
+
+
+        if (
+          startEspNow()
+        )
+        {
+          Serial.println(
+            "ESP-NOW initialization SUCCESS"
+          );
+        }
+        else
+        {
+          Serial.println(
+            "ESP-NOW initialization FAILED"
+          );
+        }
+      }
+    }
+
+
+    // ==================================================
+    // PROCESS RECEIVED PACKETS
+    // ==================================================
+
+    if (
+      espNowReady
+    )
+    {
+      processRxQueue();
+    }
+
+
+    // ==================================================
+    // FRAME SAMPLE
+    // ==================================================
 
     if (
       packetsGood > 0 &&
       now -
-      lastFramePrintMillis >=
-      5000
+        lastFramePrintMillis >=
+        5000
     )
     {
       lastFramePrintMillis =
@@ -1196,14 +1322,14 @@ public:
     }
 
 
-    // --------------------------------------------------
-    // Status every 2 seconds.
-    // --------------------------------------------------
+    // ==================================================
+    // STATUS
+    // ==================================================
 
     if (
       now -
-      lastStatusMillis >=
-      2000
+        lastStatusMillis >=
+        2000
     )
     {
       lastStatusMillis =
@@ -1216,7 +1342,7 @@ public:
 
 
   // ====================================================
-  // WLED INFO
+  // INFO
   // ====================================================
 
   void addToJsonInfo(
@@ -1261,7 +1387,7 @@ public:
 
   uint16_t getId() override
   {
-    return 0x5054;
+    return 0x5055;
   }
 };
 
