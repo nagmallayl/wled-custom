@@ -2,7 +2,7 @@
 #include "driver/i2s.h"
 
 // ======================================================
-// WS2811 I2S RX STREAMING TEST V3
+// WS2811 I2S RX STREAMING TEST V4
 //
 // ESP32 Classic / GL-C-016WL-D
 // Arduino-ESP32 2.x / ESP-IDF 4.4
@@ -61,12 +61,10 @@
 // ======================================================
 // WS2811 DECODER
 //
-// Previous successful measurements:
+// Proven working:
 //
-// 0 HIGH ≈ 3-4 samples
-// 1 HIGH ≈ 12-13 samples
-//
-// threshold = 8
+// bit 0 HIGH ≈ 3-4 samples
+// bit 1 HIGH ≈ 12-13 samples
 // ======================================================
 
 #define ONE_HIGH_SAMPLES 8
@@ -79,20 +77,19 @@
 // RESET
 //
 // 10 MHz:
-// 500 samples ≈ 50 us
+//
+// 500  samples ≈ 50 us
+// 1000 samples ≈ 100 us
+//
+// V4 uses 100 us as actual frame boundary.
 // ======================================================
 
-#define RESET_LOW_SAMPLES 500
+#define RESET_DIAGNOSTIC_MIN 500
+#define RESET_LOW_SAMPLES    1000
 
 
 // ======================================================
 // DMA
-//
-// V2:
-// 8 × 512
-//
-// V3:
-// 16 × 1024
 // ======================================================
 
 #define DMA_BUFFER_COUNT 16
@@ -141,17 +138,17 @@ static uint32_t invalidHigh = 0;
 
 static uint32_t resetsSeen = 0;
 
+// NEW:
+// LOW gap between 50us and 100us
+static uint32_t reset50to100 = 0;
+
 static uint32_t dmaReads = 0;
 
 static uint32_t lastDebugMs = 0;
 static uint32_t lastFramePrintMs = 0;
 
-
-// Last completed bad frame
 static uint16_t lastBadBits = 0;
 
-
-// Min/max completed frame sizes
 static uint16_t minBadBits = 0xFFFF;
 static uint16_t maxBadBits = 0;
 
@@ -183,28 +180,22 @@ static void addBit(bool bit)
     return;
   }
 
-
-  // Ignore anything beyond expected frame size.
   if (frameBitCount >= FRAME_BITS)
   {
     return;
   }
 
-
   uint16_t byteIndex =
     frameBitCount >> 3;
 
-
   uint8_t bitPosition =
     7 - (frameBitCount & 0x07);
-
 
   if (bit)
   {
     frameBuffer[byteIndex] |=
       (1U << bitPosition);
   }
-
 
   frameBitCount++;
 }
@@ -223,7 +214,6 @@ static void decodeHigh(
     return;
   }
 
-
   if (
     highSamples < MIN_HIGH_SAMPLES ||
     highSamples > MAX_HIGH_SAMPLES
@@ -234,10 +224,8 @@ static void decodeHigh(
     return;
   }
 
-
   bool bit =
     highSamples >= ONE_HIGH_SAMPLES;
-
 
   addBit(bit);
 }
@@ -251,8 +239,6 @@ static void printFrame()
 {
   uint32_t now = millis();
 
-
-  // Print max once per second.
   if (
     now - lastFramePrintMs < 1000
   )
@@ -260,16 +246,13 @@ static void printFrame()
     return;
   }
 
-
   lastFramePrintMs = now;
-
 
   Serial.println();
 
   Serial.println(
     "========== I2S RX FRAME =========="
   );
-
 
   for (
     uint8_t i = 0;
@@ -279,29 +262,24 @@ static void printFrame()
   {
     uint8_t p = i * 3;
 
-
     Serial.print("IC");
     Serial.print(i + 1);
-
 
     Serial.print(": G=");
     Serial.print(
       frameBuffer[p + 0]
     );
 
-
     Serial.print(" R=");
     Serial.print(
       frameBuffer[p + 1]
     );
-
 
     Serial.print(" B=");
     Serial.println(
       frameBuffer[p + 2]
     );
   }
-
 
   Serial.println(
     "=================================="
@@ -310,7 +288,7 @@ static void printFrame()
 
 
 // ======================================================
-// CLASSIFY BAD COMPLETED FRAME
+// REGISTER BAD FRAME
 // ======================================================
 
 static void registerBadFrame(
@@ -319,18 +297,15 @@ static void registerBadFrame(
 {
   lastBadBits = bits;
 
-
   if (bits < minBadBits)
   {
     minBadBits = bits;
   }
 
-
   if (bits > maxBadBits)
   {
     maxBadBits = bits;
   }
-
 
   if (bits == FRAME_BITS - 1)
   {
@@ -358,36 +333,22 @@ static void onResetGap()
 {
   resetsSeen++;
 
-
-  // ====================================================
-  // LAST PENDING HIGH
-  //
-  // Decode the final HIGH pulse before evaluating
-  // the completed frame.
-  // ====================================================
-
+  // Decode final pending HIGH first
   if (havePendingHigh)
   {
     decodeHigh(
       pendingHighLength
     );
 
-
     havePendingHigh = false;
 
     pendingHighLength = 0;
   }
 
-
-  // ====================================================
-  // EVALUATE THE FRAME THAT ACTUALLY ENDED
-  // ====================================================
-
   if (synced)
   {
     uint16_t completedBits =
       frameBitCount;
-
 
     if (
       completedBits == FRAME_BITS
@@ -407,11 +368,6 @@ static void onResetGap()
     }
   }
 
-
-  // ====================================================
-  // PREPARE FOR NEXT FRAME
-  // ====================================================
-
   resetFrame();
 
   synced = true;
@@ -426,7 +382,6 @@ static void processSample(
   bool level
 )
 {
-  // First sample
   if (runLength == 0)
   {
     currentLevel = level;
@@ -436,8 +391,6 @@ static void processSample(
     return;
   }
 
-
-  // Same state continues
   if (level == currentLevel)
   {
     runLength++;
@@ -453,10 +406,8 @@ static void processSample(
   uint32_t completedRun =
     runLength;
 
-
   bool completedLevel =
     currentLevel;
-
 
   currentLevel = level;
 
@@ -465,8 +416,6 @@ static void processSample(
 
   // ====================================================
   // HIGH -> LOW
-  //
-  // Save HIGH duration.
   // ====================================================
 
   if (completedLevel)
@@ -474,10 +423,8 @@ static void processSample(
     pendingHighLength =
       completedRun;
 
-
     havePendingHigh =
       true;
-
 
     return;
   }
@@ -491,11 +438,23 @@ static void processSample(
     completedRun;
 
 
-  // ====================================================
-  // RESET GAP
-  //
-  // If LOW is >= 50 us, this is the frame boundary.
-  // ====================================================
+  // ----------------------------------------------------
+  // Diagnostic:
+  // LOW between 50us and 100us
+  // ----------------------------------------------------
+
+  if (
+    lowSamples >= RESET_DIAGNOSTIC_MIN &&
+    lowSamples < RESET_LOW_SAMPLES
+  )
+  {
+    reset50to100++;
+  }
+
+
+  // ----------------------------------------------------
+  // Actual frame RESET
+  // ----------------------------------------------------
 
   if (
     lowSamples >= RESET_LOW_SAMPLES
@@ -507,9 +466,9 @@ static void processSample(
   }
 
 
-  // ====================================================
-  // NORMAL DATA BIT
-  // ====================================================
+  // ----------------------------------------------------
+  // Normal bit
+  // ----------------------------------------------------
 
   if (havePendingHigh)
   {
@@ -517,13 +476,9 @@ static void processSample(
       pendingHighLength
     );
 
+    havePendingHigh = false;
 
-    havePendingHigh =
-      false;
-
-
-    pendingHighLength =
-      0;
+    pendingHighLength = 0;
   }
 }
 
@@ -536,9 +491,6 @@ static void processWord(
   uint16_t word
 )
 {
-  // Keep same bit order as V2 because decoding
-  // already proved correct.
-
   for (
     int8_t bit = 15;
     bit >= 0;
@@ -547,7 +499,6 @@ static void processWord(
   {
     bool level =
       (word >> bit) & 0x01;
-
 
     processSample(
       level
@@ -564,53 +515,38 @@ static bool setupI2S()
 {
   i2s_config_t config = {};
 
-
   config.mode =
     (i2s_mode_t)(
       I2S_MODE_MASTER |
       I2S_MODE_RX
     );
 
-
   config.sample_rate =
     I2S_SAMPLE_RATE;
-
 
   config.bits_per_sample =
     I2S_BITS_PER_SAMPLE_16BIT;
 
-
   config.channel_format =
     I2S_CHANNEL_FMT_RIGHT_LEFT;
-
 
   config.communication_format =
     I2S_COMM_FORMAT_STAND_I2S;
 
-
   config.intr_alloc_flags =
     ESP_INTR_FLAG_LEVEL1;
-
-
-  // ====================================================
-  // V3 DMA SETTINGS
-  // ====================================================
 
   config.dma_buf_count =
     DMA_BUFFER_COUNT;
 
-
   config.dma_buf_len =
     DMA_BUFFER_LENGTH;
-
 
   config.use_apll =
     false;
 
-
   config.tx_desc_auto_clear =
     false;
-
 
   config.fixed_mclk =
     0;
@@ -627,7 +563,6 @@ static bool setupI2S()
       nullptr
     );
 
-
   if (err != ESP_OK)
   {
     Serial.print(
@@ -642,28 +577,19 @@ static bool setupI2S()
   }
 
 
-  // ====================================================
-  // PIN ROUTING
-  // ====================================================
-
   i2s_pin_config_t pins = {};
-
 
   pins.mck_io_num =
     I2S_PIN_NO_CHANGE;
 
-
   pins.bck_io_num =
     I2S_BCK_GPIO;
-
 
   pins.ws_io_num =
     I2S_WS_GPIO;
 
-
   pins.data_out_num =
     I2S_PIN_NO_CHANGE;
-
 
   pins.data_in_num =
     DATA_INPUT_GPIO;
@@ -674,7 +600,6 @@ static bool setupI2S()
       RX_I2S_PORT,
       &pins
     );
-
 
   if (err != ESP_OK)
   {
@@ -713,9 +638,8 @@ public:
     );
 
     Serial.println(
-      "WS2811 I2S RX STREAMING TEST V3"
+      "WS2811 I2S RX STREAMING TEST V4"
     );
-
 
     Serial.print(
       "DATA input: GPIO"
@@ -725,7 +649,6 @@ public:
       DATA_INPUT_GPIO
     );
 
-
     Serial.print(
       "I2S BCK: GPIO"
     );
@@ -733,7 +656,6 @@ public:
     Serial.println(
       I2S_BCK_GPIO
     );
-
 
     Serial.print(
       "I2S WS: GPIO"
@@ -743,31 +665,25 @@ public:
       I2S_WS_GPIO
     );
 
-
     Serial.println(
       "BCK/WS: LEAVE UNCONNECTED"
     );
-
 
     Serial.println(
       "I2S port: 1"
     );
 
-
     Serial.println(
       "Sampling: ~10 MHz"
     );
-
 
     Serial.println(
       "RMT RX: NOT USED"
     );
 
-
     Serial.println(
       "LED output: DISABLED"
     );
-
 
     Serial.print(
       "Expected ICs: "
@@ -777,7 +693,6 @@ public:
       TEST_ICS
     );
 
-
     Serial.print(
       "Expected bits: "
     );
@@ -786,9 +701,8 @@ public:
       FRAME_BITS
     );
 
-
     Serial.print(
-      "Reset threshold: "
+      "Actual RESET: "
     );
 
     Serial.print(
@@ -796,9 +710,28 @@ public:
     );
 
     Serial.println(
-      " samples (~50 us)"
+      " samples (~100 us)"
     );
 
+    Serial.print(
+      "Diagnostic gap: "
+    );
+
+    Serial.print(
+      RESET_DIAGNOSTIC_MIN
+    );
+
+    Serial.print(
+      "-"
+    );
+
+    Serial.print(
+      RESET_LOW_SAMPLES - 1
+    );
+
+    Serial.println(
+      " samples"
+    );
 
     Serial.print(
       "DMA buffers: "
@@ -815,12 +748,6 @@ public:
     Serial.println(
       DMA_BUFFER_LENGTH
     );
-
-
-    Serial.println(
-      "Bad-frame diagnostics: ENABLED"
-    );
-
 
     Serial.println(
       "================================"
@@ -851,7 +778,6 @@ public:
   {
     size_t bytesRead = 0;
 
-
     esp_err_t err =
       i2s_read(
         RX_I2S_PORT,
@@ -869,11 +795,9 @@ public:
     {
       dmaReads++;
 
-
       size_t words =
         bytesRead /
         sizeof(uint16_t);
-
 
       for (
         size_t i = 0;
@@ -889,19 +813,17 @@ public:
 
 
     // ==================================================
-    // STATUS EVERY 2 SECONDS
+    // STATUS
     // ==================================================
 
     uint32_t now =
       millis();
-
 
     if (
       now - lastDebugMs >= 2000
     )
     {
       lastDebugMs = now;
-
 
       uint32_t totalBad =
         bad119 +
@@ -946,15 +868,6 @@ public:
 
 
       Serial.print(
-        "  BadOther: "
-      );
-
-      Serial.print(
-        badOther
-      );
-
-
-      Serial.print(
         "  LastBadBits: "
       );
 
@@ -966,7 +879,6 @@ public:
       Serial.print(
         "  BadRange: "
       );
-
 
       if (minBadBits == 0xFFFF)
       {
@@ -988,6 +900,15 @@ public:
           maxBadBits
         );
       }
+
+
+      Serial.print(
+        "  Reset50to100: "
+      );
+
+      Serial.print(
+        reset50to100
+      );
 
 
       Serial.print(
@@ -1039,13 +960,13 @@ public:
 
   uint16_t getId() override
   {
-    return 0x5049;
+    return 0x5050;
   }
 };
 
 
 // ======================================================
-// REGISTER USERMOD
+// REGISTER
 // ======================================================
 
 static I2SStreamingRxUsermod
