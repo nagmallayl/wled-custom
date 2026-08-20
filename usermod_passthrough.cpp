@@ -1,572 +1,702 @@
 #include "wled.h"
-#include "driver/rmt.h"
+#include "driver/i2s.h"
 
 // ======================================================
-// WS2811 PASSTHROUGH - FINAL
+// WS2811 I2S RX STREAMING TEST
 //
-// INPUT : GPIO25 / RMT RX
-// OUTPUT: WLED / I2S / GPIO16
+// ESP32 Classic / Arduino-ESP32 2.x / IDF 4.4
 //
-// WLED : v16.0.0
+// INPUT:
+// GPIO25 = WS2811 DATA
+//
+// I2S generated clocks:
+// GPIO16 = BCK   (leave unconnected)
+// GPIO2  = WS    (leave unconnected)
+//
+// NO LED OUTPUT IN THIS TEST
+// NO RMT RX
+//
+// Purpose:
+// continuously sample WS2811 into DMA/RAM,
+// removing the RMT frame-size limitation.
 // ======================================================
 
 
 // ======================================================
-// INPUT
+// PINS
 // ======================================================
 
-#define INPUT_GPIO 25
+#define DATA_INPUT_GPIO 25
 
-// RMT is used ONLY for receiving.
-#define RX_CHANNEL RMT_CHANNEL_6
-
-// ESP32:
-// 80 MHz / 2 = 40 MHz
-// 1 tick = 25 ns
-#define RMT_CLK_DIV 2
+#define I2S_BCK_GPIO    16
+#define I2S_WS_GPIO     2
 
 
 // ======================================================
-// STRIP
+// I2S
 // ======================================================
 
-// Current strip:
-// 15 physical LEDs
-// 5 WS2811 ICs
-#define PHYSICAL_LEDS 15
-#define WS2811_ICS    5
-
-#define FRAME_BYTES   (WS2811_ICS * 3)
-#define FRAME_BITS    (FRAME_BYTES * 8)
+#define RX_I2S_PORT I2S_NUM_1
 
 
 // ======================================================
-// MEASURED WS2811 INPUT TIMING
+// SAMPLING
 // ======================================================
 //
-// Actual measurements:
+// Stereo × 16 bit:
 //
-// bit 0:
-// HIGH ≈ 14~15 ticks
+// BCK = sample_rate × 2 × 16
 //
-// bit 1:
-// HIGH ≈ 50~51 ticks
+// 312500 × 32 = 10,000,000 Hz
 //
 // Therefore:
-#define BIT_THRESHOLD 30
+//
+// one sampled bit = 100 ns
+// ======================================================
+
+#define I2S_SAMPLE_RATE 312500
+
+#define SAMPLE_CLOCK_HZ 10000000UL
 
 
 // ======================================================
-// RMT RX
+// TEST FRAME
+// ======================================================
+//
+// Current short strip:
+// 5 WS2811 IC
+//
+// 5 × 24 = 120 bits
+// 5 × 3  = 15 data bytes
 // ======================================================
 
-// This value produced clean 120-symbol frames
-// after separating WLED output to I2S.
-#define RMT_IDLE_TICKS 3000
-
-
-// ======================================================
-// WLED REALTIME
-// ======================================================
-
-// Realtime is refreshed for every valid frame.
-#define REALTIME_LOCK_MS 1000
-
-// Return control to normal WLED effects if
-// GPIO25 signal disappears.
-#define SIGNAL_TIMEOUT_MS 1500
+#define TEST_ICS     5
+#define FRAME_BYTES  (TEST_ICS * 3)
+#define FRAME_BITS   (FRAME_BYTES * 8)
 
 
 // ======================================================
-// DEBUG
+// WS2811 TIMING
+// ======================================================
+//
+// Previous real measurements:
+//
+// bit 0 HIGH:
+// ~0.35 - 0.38 us
+//
+// bit 1 HIGH:
+// ~1.25 us
+//
+// At 10 MHz:
+//
+// bit 0 HIGH ≈ 3-4 samples
+// bit 1 HIGH ≈ 12-13 samples
+//
+// threshold = 8 samples
 // ======================================================
 
-// Lightweight status only every 10 seconds.
-#define DEBUG_INTERVAL_MS 10000
+#define ONE_HIGH_SAMPLES 8
+
+// Reject impossible HIGH pulses
+#define MIN_HIGH_SAMPLES 2
+#define MAX_HIGH_SAMPLES 20
 
 
-class PassthroughUsermod : public Usermod {
+// ======================================================
+// RESET / FRAME BOUNDARY
+// ======================================================
+//
+// WS2811 reset LOW is far longer than normal data LOW.
+//
+// At 10 MHz:
+//
+// 30 us = 300 samples
+//
+// We deliberately use 30 us first.
+// ======================================================
 
-private:
-
-  RingbufHandle_t rxRingBuffer = nullptr;
-
-  bool rxReady = false;
-
-  bool realtimeActive = false;
-
-
-  // ====================================================
-  // FRAME
-  // ====================================================
-
-  uint8_t frameBuffer[FRAME_BYTES];
+#define RESET_LOW_SAMPLES 300
 
 
-  // ====================================================
-  // TIMING
-  // ====================================================
+// ======================================================
+// DMA READ BUFFER
+// ======================================================
 
-  uint32_t lastFrameTime = 0;
-  uint32_t lastDebugTime = 0;
+#define DMA_WORDS 512
 
-
-  // ====================================================
-  // STATISTICS
-  // ====================================================
-
-  uint32_t packetsReceived = 0;
-  uint32_t goodFrames      = 0;
-  uint32_t shownFrames     = 0;
-
-  uint32_t shortPackets    = 0;
-  uint32_t longPackets     = 0;
+static uint16_t dmaBuffer[DMA_WORDS];
 
 
-  // ====================================================
-  // WLED REALTIME
-  // ====================================================
+// ======================================================
+// FRAME BUFFER
+// ======================================================
 
-  void keepRealtimeActive()
+static uint8_t frameBuffer[FRAME_BYTES];
+
+
+// ======================================================
+// DECODER STATE
+// ======================================================
+
+static bool synced = false;
+
+static bool currentLevel = false;
+
+static uint32_t runLength = 0;
+
+static uint32_t pendingHighLength = 0;
+
+static bool havePendingHigh = false;
+
+static uint16_t frameBitCount = 0;
+
+
+// ======================================================
+// STATISTICS
+// ======================================================
+
+static uint32_t framesGood = 0;
+static uint32_t framesBad = 0;
+
+static uint32_t invalidHigh = 0;
+
+static uint32_t resetsSeen = 0;
+
+static uint32_t dmaReads = 0;
+
+static uint32_t lastDebugMs = 0;
+static uint32_t lastFramePrintMs = 0;
+
+
+// ======================================================
+// RESET FRAME
+// ======================================================
+
+static void resetFrame()
+{
+  memset(
+    frameBuffer,
+    0,
+    sizeof(frameBuffer)
+  );
+
+  frameBitCount = 0;
+}
+
+
+// ======================================================
+// ADD ONE DECODED WS2811 BIT
+// ======================================================
+
+static void addBit(bool bit)
+{
+  if (!synced)
+    return;
+
+
+  if (frameBitCount >= FRAME_BITS)
   {
-    realtimeLock(
-      REALTIME_LOCK_MS,
-      REALTIME_MODE_UDP
-    );
-
-    realtimeActive = true;
+    return;
   }
 
 
-  // ====================================================
-  // DECODE COMPLETE RMT PACKET
-  // ====================================================
+  uint16_t byteIndex =
+    frameBitCount >> 3;
 
-  bool decodePacket(
-    rmt_item32_t *items,
-    size_t count
+
+  uint8_t bitPosition =
+    7 - (frameBitCount & 7);
+
+
+  if (bit)
+  {
+    frameBuffer[byteIndex] |=
+      (1U << bitPosition);
+  }
+
+
+  frameBitCount++;
+}
+
+
+// ======================================================
+// DECODE HIGH PULSE
+// ======================================================
+
+static void decodeHigh(
+  uint32_t highSamples
+)
+{
+  if (!synced)
+    return;
+
+
+  if (
+    highSamples < MIN_HIGH_SAMPLES ||
+    highSamples > MAX_HIGH_SAMPLES
   )
   {
-    if (!items)
-      return false;
+    invalidHigh++;
+    return;
+  }
 
 
-    packetsReceived++;
+  bool bit =
+    highSamples >= ONE_HIGH_SAMPLES;
 
 
-    // --------------------------------------------------
-    // We only accept complete WS2811 frames.
-    //
-    // Expected:
-    // 5 IC × 24 bit = 120 symbols
-    // --------------------------------------------------
-
-    if (count < FRAME_BITS)
-    {
-      shortPackets++;
-
-      return false;
-    }
+  addBit(bit);
+}
 
 
-    if (count > FRAME_BITS + 8)
-    {
-      longPackets++;
-    }
+// ======================================================
+// PRINT FRAME
+// ======================================================
+
+static void printFrame()
+{
+  uint32_t now = millis();
 
 
-    memset(
-      frameBuffer,
-      0,
-      sizeof(frameBuffer)
+  if (
+    now - lastFramePrintMs <
+    1000
+  )
+  {
+    return;
+  }
+
+
+  lastFramePrintMs = now;
+
+
+  Serial.println();
+
+  Serial.println(
+    "========== I2S RX FRAME =========="
+  );
+
+
+  for (
+    uint8_t i = 0;
+    i < TEST_ICS;
+    i++
+  )
+  {
+    uint8_t p =
+      i * 3;
+
+
+    Serial.print("IC");
+    Serial.print(i + 1);
+
+
+    Serial.print(": G=");
+    Serial.print(
+      frameBuffer[p + 0]
     );
 
 
-    uint16_t bitIndex = 0;
+    Serial.print(" R=");
+    Serial.print(
+      frameBuffer[p + 1]
+    );
 
 
-    // ==================================================
-    // DECODE FIRST 120 NON-EMPTY SYMBOLS
-    // ==================================================
-
-    for (
-      size_t i = 0;
-      i < count && bitIndex < FRAME_BITS;
-      i++
-    )
-    {
-      // Ignore an empty RMT end item.
-      if (
-        items[i].duration0 == 0 &&
-        items[i].duration1 == 0
-      )
-      {
-        continue;
-      }
-
-
-      // ------------------------------------------------
-      // Decoder confirmed by actual measurements:
-      //
-      // H < 30  = 0
-      // H >= 30 = 1
-      // ------------------------------------------------
-
-      bool bit =
-        items[i].duration0 >= BIT_THRESHOLD;
-
-
-      uint8_t byteIndex =
-        bitIndex >> 3;
-
-
-      uint8_t bitPosition =
-        7 - (bitIndex & 0x07);
-
-
-      if (bit)
-      {
-        frameBuffer[byteIndex] |=
-          (1U << bitPosition);
-      }
-
-
-      bitIndex++;
-    }
-
-
-    if (bitIndex != FRAME_BITS)
-    {
-      shortPackets++;
-
-      return false;
-    }
-
-
-    goodFrames++;
-
-
-    return true;
+    Serial.print(" B=");
+    Serial.println(
+      frameBuffer[p + 2]
+    );
   }
 
 
-  // ====================================================
-  // OUTPUT FRAME
-  // ====================================================
+  Serial.println(
+    "=================================="
+  );
+}
 
-  void showFrame()
+
+// ======================================================
+// FRAME BOUNDARY
+// ======================================================
+
+static void onResetGap()
+{
+  resetsSeen++;
+
+
+  if (synced)
   {
-    // --------------------------------------------------
-    // Enter/refresh WLED realtime mode.
-    //
-    // Normal WLED effects are suspended while the
-    // passthrough signal is active.
-    // --------------------------------------------------
-
-    keepRealtimeActive();
-
-
-    // ==================================================
-    // COLOR MAPPING
-    //
-    // Incoming:
-    //
-    // G R B
-    //
-    // Required output:
-    //
-    // B R G
-    //
-    // WLED setPixelColor() expects:
-    //
-    // R, G, B
-    //
-    // Therefore:
-    //
-    // R = input B
-    // G = input R
-    // B = input G
-    // ==================================================
-
-    for (
-      uint8_t i = 0;
-      i < WS2811_ICS;
-      i++
-    )
-    {
-      uint8_t p =
-        i * 3;
-
-
-      uint8_t inputG =
-        frameBuffer[p + 0];
-
-
-      uint8_t inputR =
-        frameBuffer[p + 1];
-
-
-      uint8_t inputB =
-        frameBuffer[p + 2];
-
-
-      strip.setPixelColor(
-        i,
-        inputB,  // output R
-        inputR,  // output G
-        inputG   // output B
-      );
-    }
-
-
-    // ==================================================
-    // IMPORTANT
-    //
-    // WLED LED Preferences must remain:
-    //
-    // GPIO16
-    // Driver = I2S
-    //
-    // Therefore this show() uses I2S output and does
-    // NOT interfere with RMT RX on GPIO25.
-    // ==================================================
-
-    strip.show();
-
-
-    shownFrames++;
-
-
-    lastFrameTime =
-      millis();
-  }
-
-
-  // ====================================================
-  // RMT RX SETUP
-  // ====================================================
-
-  bool setupRX()
-  {
-    rmt_config_t config = {};
-
-
-    config.rmt_mode =
-      RMT_MODE_RX;
-
-
-    config.channel =
-      RX_CHANNEL;
-
-
-    config.gpio_num =
-      (gpio_num_t)INPUT_GPIO;
-
-
-    config.clk_div =
-      RMT_CLK_DIV;
-
-
-    // Two blocks proved sufficient for the
-    // 120-symbol frame.
-    config.mem_block_num =
-      2;
-
-
-    config.flags =
-      0;
-
-
-    config.rx_config.filter_en =
-      false;
-
-
-    config.rx_config.idle_threshold =
-      RMT_IDLE_TICKS;
-
-
-    esp_err_t err;
-
-
-    // --------------------------------------------------
-    // Configure RMT
-    // --------------------------------------------------
-
-    err =
-      rmt_config(
-        &config
-      );
-
-
-    if (err != ESP_OK)
-    {
-      Serial.print(
-        "RMT CONFIG ERROR: "
-      );
-
-      Serial.println(err);
-
-      return false;
-    }
-
-
-    // --------------------------------------------------
-    // Install RX driver
-    // --------------------------------------------------
-
-    err =
-      rmt_driver_install(
-        RX_CHANNEL,
-        4096,
-        0
-      );
-
-
-    if (err != ESP_OK)
-    {
-      Serial.print(
-        "RMT DRIVER ERROR: "
-      );
-
-      Serial.println(err);
-
-      return false;
-    }
-
-
-    // --------------------------------------------------
-    // Get RX ring buffer
-    // --------------------------------------------------
-
-    err =
-      rmt_get_ringbuf_handle(
-        RX_CHANNEL,
-        &rxRingBuffer
-      );
-
-
     if (
-      err != ESP_OK ||
-      rxRingBuffer == nullptr
+      frameBitCount == FRAME_BITS
     )
     {
-      Serial.println(
-        "RMT RINGBUFFER ERROR"
-      );
+      framesGood++;
 
-      return false;
+      printFrame();
     }
-
-
-    // --------------------------------------------------
-    // Start RX
-    // --------------------------------------------------
-
-    err =
-      rmt_rx_start(
-        RX_CHANNEL,
-        true
-      );
-
-
-    if (err != ESP_OK)
+    else if (
+      frameBitCount != 0
+    )
     {
-      Serial.print(
-        "RMT RX START ERROR: "
-      );
-
-      Serial.println(err);
-
-      return false;
+      framesBad++;
     }
-
-
-    return true;
   }
 
+
+  resetFrame();
+
+  synced = true;
+}
+
+
+// ======================================================
+// PROCESS ONE DIGITAL SAMPLE
+// ======================================================
+
+static void processSample(
+  bool level
+)
+{
+  // First sample
+  if (runLength == 0)
+  {
+    currentLevel = level;
+
+    runLength = 1;
+
+    return;
+  }
+
+
+  // Same level continues
+  if (level == currentLevel)
+  {
+    runLength++;
+
+    return;
+  }
+
+
+  // ====================================================
+  // LEVEL CHANGED
+  // ====================================================
+
+  uint32_t completedRun =
+    runLength;
+
+
+  bool completedLevel =
+    currentLevel;
+
+
+  currentLevel = level;
+
+  runLength = 1;
+
+
+  // ====================================================
+  // HIGH -> LOW
+  //
+  // Save HIGH length.
+  // ====================================================
+
+  if (completedLevel)
+  {
+    pendingHighLength =
+      completedRun;
+
+    havePendingHigh =
+      true;
+
+    return;
+  }
+
+
+  // ====================================================
+  // LOW -> HIGH
+  //
+  // We now know:
+  //
+  // previous HIGH length
+  // previous LOW length
+  //
+  // So one WS2811 bit can be decoded.
+  // ====================================================
+
+  uint32_t lowSamples =
+    completedRun;
+
+
+  // Decode the bit that preceded this LOW.
+  if (havePendingHigh)
+  {
+    decodeHigh(
+      pendingHighLength
+    );
+
+    havePendingHigh =
+      false;
+  }
+
+
+  // Reset / frame boundary
+  if (
+    lowSamples >= RESET_LOW_SAMPLES
+  )
+  {
+    onResetGap();
+  }
+}
+
+
+// ======================================================
+// PROCESS ONE I2S WORD
+// ======================================================
+//
+// Each 16-bit I2S word contains 16 consecutive
+// serial samples from DATA_INPUT_GPIO.
+//
+// Start with MSB first.
+// If diagnostic later proves bit order reversed,
+// we only change this small function.
+// ======================================================
+
+static void processWord(
+  uint16_t word
+)
+{
+  for (
+    int8_t bit = 15;
+    bit >= 0;
+    bit--
+  )
+  {
+    bool level =
+      (word >> bit) & 0x01;
+
+
+    processSample(level);
+  }
+}
+
+
+// ======================================================
+// SETUP I2S RX
+// ======================================================
+
+static bool setupI2S()
+{
+  i2s_config_t config = {};
+
+
+  config.mode =
+    (i2s_mode_t)(
+      I2S_MODE_MASTER |
+      I2S_MODE_RX
+    );
+
+
+  config.sample_rate =
+    I2S_SAMPLE_RATE;
+
+
+  config.bits_per_sample =
+    I2S_BITS_PER_SAMPLE_16BIT;
+
+
+  config.channel_format =
+    I2S_CHANNEL_FMT_RIGHT_LEFT;
+
+
+  config.communication_format =
+    I2S_COMM_FORMAT_STAND_I2S;
+
+
+  config.intr_alloc_flags =
+    ESP_INTR_FLAG_LEVEL1;
+
+
+  config.dma_buf_count =
+    8;
+
+
+  config.dma_buf_len =
+    512;
+
+
+  config.use_apll =
+    false;
+
+
+  config.tx_desc_auto_clear =
+    false;
+
+
+  config.fixed_mclk =
+    0;
+
+
+  esp_err_t err;
+
+
+  err =
+    i2s_driver_install(
+      RX_I2S_PORT,
+      &config,
+      0,
+      nullptr
+    );
+
+
+  if (err != ESP_OK)
+  {
+    Serial.print(
+      "I2S DRIVER ERROR: "
+    );
+
+    Serial.println(err);
+
+    return false;
+  }
+
+
+  // ====================================================
+  // PIN ROUTING
+  // ====================================================
+
+  i2s_pin_config_t pins = {};
+
+
+  pins.mck_io_num =
+    I2S_PIN_NO_CHANGE;
+
+
+  pins.bck_io_num =
+    I2S_BCK_GPIO;
+
+
+  pins.ws_io_num =
+    I2S_WS_GPIO;
+
+
+  pins.data_out_num =
+    I2S_PIN_NO_CHANGE;
+
+
+  pins.data_in_num =
+    DATA_INPUT_GPIO;
+
+
+  err =
+    i2s_set_pin(
+      RX_I2S_PORT,
+      &pins
+    );
+
+
+  if (err != ESP_OK)
+  {
+    Serial.print(
+      "I2S PIN ERROR: "
+    );
+
+    Serial.println(err);
+
+    return false;
+  }
+
+
+  return true;
+}
+
+
+// ======================================================
+// USERMOD
+// ======================================================
+
+class I2SStreamingRxUsermod :
+  public Usermod
+{
 
 public:
 
-  // ====================================================
-  // SETUP
-  // ====================================================
-
   void setup() override
   {
-    pinMode(
-      INPUT_GPIO,
-      INPUT
-    );
-
-
-    memset(
-      frameBuffer,
-      0,
-      sizeof(frameBuffer)
-    );
-
-
     Serial.println();
 
     Serial.println(
       "================================"
     );
 
-
     Serial.println(
-      "WS2811 PASSTHROUGH FINAL"
-    );
-
-
-    Serial.println(
-      "WLED: v16.0.0"
+      "WS2811 I2S RX STREAMING TEST"
     );
 
 
     Serial.print(
-      "Input GPIO: "
+      "DATA input: GPIO"
     );
 
     Serial.println(
-      INPUT_GPIO
-    );
-
-
-    Serial.println(
-      "RX: RMT Channel 6"
-    );
-
-
-    Serial.println(
-      "Output: WLED I2S"
-    );
-
-
-    Serial.println(
-      "Output GPIO: 16"
+      DATA_INPUT_GPIO
     );
 
 
     Serial.print(
-      "Physical LEDs: "
+      "I2S BCK: GPIO"
     );
 
     Serial.println(
-      PHYSICAL_LEDS
+      I2S_BCK_GPIO
     );
 
 
     Serial.print(
-      "WS2811 ICs: "
+      "I2S WS: GPIO"
     );
 
     Serial.println(
-      WS2811_ICS
+      I2S_WS_GPIO
+    );
+
+
+    Serial.println(
+      "BCK/WS: LEAVE UNCONNECTED"
+    );
+
+
+    Serial.println(
+      "I2S port: 1"
+    );
+
+
+    Serial.println(
+      "Sampling: ~10 MHz"
+    );
+
+
+    Serial.println(
+      "RMT RX: NOT USED"
+    );
+
+
+    Serial.println(
+      "LED output: DISABLED"
     );
 
 
     Serial.print(
-      "Frame bits: "
+      "Expected ICs: "
+    );
+
+    Serial.println(
+      TEST_ICS
+    );
+
+
+    Serial.print(
+      "Expected bits: "
     );
 
     Serial.println(
@@ -575,53 +705,22 @@ public:
 
 
     Serial.println(
-      "Input order: GRB"
-    );
-
-
-    Serial.println(
-      "Output order: BRG"
-    );
-
-
-    Serial.println(
-      "Effects: AUTO"
-    );
-
-
-    Serial.println(
-      "Passthrough: REALTIME"
-    );
-
-
-    Serial.println(
       "================================"
     );
 
 
-    if (setupRX())
+    if (setupI2S())
     {
-      rxReady = true;
-
-
       Serial.println(
-        "RMT RX READY"
+        "I2S RX READY"
       );
     }
     else
     {
       Serial.println(
-        "RMT RX FAILED"
+        "I2S RX FAILED"
       );
-
-
-      return;
     }
-
-
-    Serial.println(
-      "Passthrough READY"
-    );
 
 
     Serial.println(
@@ -630,230 +729,143 @@ public:
   }
 
 
-  // ====================================================
-  // LOOP
-  // ====================================================
-
   void loop() override
   {
-    if (
-      !rxReady ||
-      rxRingBuffer == nullptr
-    )
-    {
-      return;
-    }
+    size_t bytesRead = 0;
 
 
-    // =================================================
-    // RECEIVE
-    // =================================================
-
-    size_t receivedSize = 0;
-
-
-    rmt_item32_t *items =
-      (rmt_item32_t *)
-      xRingbufferReceive(
-        rxRingBuffer,
-        &receivedSize,
+    esp_err_t err =
+      i2s_read(
+        RX_I2S_PORT,
+        dmaBuffer,
+        sizeof(dmaBuffer),
+        &bytesRead,
         0
       );
 
 
-    if (items)
-    {
-      size_t count =
-        receivedSize /
-        sizeof(rmt_item32_t);
-
-
-      if (
-        decodePacket(
-          items,
-          count
-        )
-      )
-      {
-        showFrame();
-      }
-
-
-      vRingbufferReturnItem(
-        rxRingBuffer,
-        (void *)items
-      );
-    }
-
-
-    // =================================================
-    // SIGNAL LOST
-    //
-    // Return automatically to normal WLED effects.
-    // =================================================
-
     if (
-      realtimeActive &&
-      millis() - lastFrameTime >
-      SIGNAL_TIMEOUT_MS
+      err == ESP_OK &&
+      bytesRead > 0
     )
     {
-      exitRealtime();
+      dmaReads++;
 
 
-      realtimeActive =
-        false;
+      size_t words =
+        bytesRead /
+        sizeof(uint16_t);
 
 
-      Serial.println(
-        "Passthrough OFF -> WLED"
-      );
+      for (
+        size_t i = 0;
+        i < words;
+        i++
+      )
+      {
+        processWord(
+          dmaBuffer[i]
+        );
+      }
     }
 
 
-    // =================================================
-    // LIGHTWEIGHT DEBUG
-    // =================================================
+    // ==================================================
+    // STATUS
+    // ==================================================
 
     uint32_t now =
       millis();
 
 
     if (
-      now - lastDebugTime >=
-      DEBUG_INTERVAL_MS
+      now - lastDebugMs >=
+      2000
     )
     {
-      lastDebugTime = now;
+      lastDebugMs = now;
 
 
       Serial.print(
-        "Frames: "
+        "Good: "
       );
 
       Serial.print(
-        goodFrames
-      );
-
-
-      Serial.print(
-        "  Shown: "
-      );
-
-      Serial.print(
-        shownFrames
+        framesGood
       );
 
 
       Serial.print(
-        "  Short: "
+        "  Bad: "
       );
 
       Serial.print(
-        shortPackets
-      );
-
-
-      Serial.print(
-        "  Long: "
-      );
-
-      Serial.print(
-        longPackets
+        framesBad
       );
 
 
       Serial.print(
-        "  Mode: "
+        "  Reset: "
+      );
+
+      Serial.print(
+        resetsSeen
       );
 
 
-      if (realtimeActive)
-      {
-        Serial.println(
-          "PASSTHROUGH"
-        );
-      }
-      else
-      {
-        Serial.println(
-          "WLED"
-        );
-      }
+      Serial.print(
+        "  InvalidHigh: "
+      );
+
+      Serial.print(
+        invalidHigh
+      );
+
+
+      Serial.print(
+        "  CurrentBits: "
+      );
+
+      Serial.print(
+        frameBitCount
+      );
+
+
+      Serial.print(
+        "/"
+      );
+
+      Serial.print(
+        FRAME_BITS
+      );
+
+
+      Serial.print(
+        "  DMAReads: "
+      );
+
+      Serial.println(
+        dmaReads
+      );
     }
-  }
-
-
-  // ====================================================
-  // WLED INFO
-  // ====================================================
-
-  void addToJsonInfo(
-    JsonObject &root
-  ) override
-  {
-    JsonObject info =
-      root["u"]
-      .createNestedObject(
-        "WS2811 Passthrough"
-      );
-
-
-    info["input"] =
-      "GPIO25 / RMT";
-
-
-    info["output"] =
-      "GPIO16 / I2S";
-
-
-    info["physical_leds"] =
-      PHYSICAL_LEDS;
-
-
-    info["ws2811_ics"] =
-      WS2811_ICS;
-
-
-    info["input_order"] =
-      "GRB";
-
-
-    info["output_order"] =
-      "BRG";
-
-
-    info["frames"] =
-      goodFrames;
-
-
-    info["shown"] =
-      shownFrames;
-
-
-    info["short"] =
-      shortPackets;
-
-
-    info["long"] =
-      longPackets;
-
-
-    info["active"] =
-      realtimeActive;
   }
 
 
   uint16_t getId() override
   {
-    return 0x5044;
+    return 0x5047;
   }
 };
 
 
-static PassthroughUsermod passthroughUsermod;
+// ======================================================
+// REGISTER
+// ======================================================
+
+static I2SStreamingRxUsermod
+i2sStreamingRxUsermod;
 
 
 REGISTER_USERMOD(
-  passthroughUsermod
+  i2sStreamingRxUsermod
 );
