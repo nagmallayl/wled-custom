@@ -1,9 +1,8 @@
 #include "wled.h"
 #include "driver/i2s.h"
-#include <WiFi.h>
 
 // ======================================================
-// WS2811 I2S RX STREAMING TEST V6
+// WS2811 I2S RX STREAMING TEST V5.1
 //
 // ESP32 Classic / GL-C-016WL-D
 //
@@ -16,12 +15,9 @@
 //
 // RX ONLY
 //
-// V6:
-// - RX Task on Core 1
-// - Low task priority
-// - Smaller DMA allocation
-// - Periodic taskYIELD()
-// - Wi-Fi diagnostics
+// Change from V5:
+// - RX task remains on Core 0
+// - RX task priority changed from 3 -> 1
 // ======================================================
 
 
@@ -46,7 +42,7 @@
 // SAMPLING
 //
 // 312500 × 32 ≈ 10 MHz BCK
-// approx. 100 ns per serial sample
+// ~100 ns per serial sample
 // ======================================================
 
 #define I2S_SAMPLE_RATE 312500
@@ -55,6 +51,7 @@
 // ======================================================
 // TEST FRAME
 //
+// Current test:
 // 5 WS2811 IC
 // 15 bytes
 // 120 bits
@@ -68,12 +65,6 @@
 // ======================================================
 // WS2811 TIMING
 // ======================================================
-//
-// Previously confirmed:
-//
-// 0 HIGH ≈ 3-4 samples
-// 1 HIGH ≈ 12-13 samples
-// ======================================================
 
 #define ONE_HIGH_SAMPLES 8
 
@@ -82,9 +73,9 @@
 
 
 // ======================================================
-// RESET
+// RESET GAP
 //
-// ~100 us at our effective sample clock
+// 1000 samples ≈ 100 us
 // ======================================================
 
 #define RESET_LOW_SAMPLES 1000
@@ -92,19 +83,12 @@
 
 // ======================================================
 // DMA
-//
-// Reduced from V5:
-//
-// V5 = 16 x 1024
-// V6 = 8 x 512
-//
-// This reduces DMA-capable RAM consumption.
 // ======================================================
 
-#define DMA_BUFFER_COUNT  8
-#define DMA_BUFFER_LENGTH 512
+#define DMA_BUFFER_COUNT 16
+#define DMA_BUFFER_LENGTH 1024
 
-#define READ_WORDS 512
+#define READ_WORDS 2048
 
 static uint16_t dmaBuffer[READ_WORDS];
 
@@ -185,10 +169,10 @@ static uint32_t lastFramePrintMs = 0;
 
 
 // ======================================================
-// RESET WORKING FRAME
+// RESET CURRENT FRAME
 // ======================================================
 
-static inline void resetFrame()
+static void resetFrame()
 {
   memset(
     workingFrame,
@@ -204,7 +188,9 @@ static inline void resetFrame()
 // ADD ONE BIT
 // ======================================================
 
-static inline void addBit(bool bit)
+static inline void addBit(
+  bool bit
+)
 {
   if (!synced)
   {
@@ -218,14 +204,11 @@ static inline void addBit(bool bit)
     return;
   }
 
-
   uint16_t byteIndex =
     frameBitCount >> 3;
 
-
   uint8_t bitPosition =
     7 - (frameBitCount & 0x07);
-
 
   if (bit)
   {
@@ -233,13 +216,12 @@ static inline void addBit(bool bit)
       (1U << bitPosition);
   }
 
-
   frameBitCount++;
 }
 
 
 // ======================================================
-// DECODE HIGH
+// DECODE HIGH PULSE
 // ======================================================
 
 static inline void decodeHigh(
@@ -251,7 +233,6 @@ static inline void decodeHigh(
     return;
   }
 
-
   if (
     highSamples < MIN_HIGH_SAMPLES ||
     highSamples > MAX_HIGH_SAMPLES
@@ -262,10 +243,8 @@ static inline void decodeHigh(
     return;
   }
 
-
   bool bit =
     highSamples >= ONE_HIGH_SAMPLES;
-
 
   addBit(bit);
 }
@@ -281,16 +260,13 @@ static void saveGoodFrame()
     &frameMux
   );
 
-
   memcpy(
     lastGoodFrame,
     workingFrame,
     FRAME_BYTES
   );
 
-
   framesGood++;
-
 
   portEXIT_CRITICAL(
     &frameMux
@@ -299,27 +275,28 @@ static void saveGoodFrame()
 
 
 // ======================================================
-// BAD FRAME
+// REGISTER BAD FRAME
 // ======================================================
 
-static inline void registerBadFrame(
+static void registerBadFrame(
   uint16_t bits
 )
 {
   lastBadBits = bits;
 
-
-  if (bits < minBadBits)
+  if (
+    bits < minBadBits
+  )
   {
     minBadBits = bits;
   }
 
-
-  if (bits > maxBadBits)
+  if (
+    bits > maxBadBits
+  )
   {
     maxBadBits = bits;
   }
-
 
   if (
     bits == FRAME_BITS - 1
@@ -342,33 +319,29 @@ static inline void registerBadFrame(
 
 
 // ======================================================
-// RESET GAP
+// FRAME RESET GAP
 // ======================================================
 
 static inline void onResetGap()
 {
   resetsSeen++;
 
-
-  // Decode final pending HIGH before closing frame.
+  // Decode final pending HIGH first.
   if (havePendingHigh)
   {
     decodeHigh(
       pendingHighLength
     );
 
-
     havePendingHigh = false;
 
     pendingHighLength = 0;
   }
 
-
   if (synced)
   {
     uint16_t completedBits =
       frameBitCount;
-
 
     if (
       completedBits == FRAME_BITS
@@ -386,7 +359,6 @@ static inline void onResetGap()
     }
   }
 
-
   resetFrame();
 
   synced = true;
@@ -394,14 +366,16 @@ static inline void onResetGap()
 
 
 // ======================================================
-// PROCESS DIGITAL SAMPLE
+// PROCESS ONE DIGITAL SAMPLE
 // ======================================================
 
 static inline void processSample(
   bool level
 )
 {
-  if (runLength == 0)
+  if (
+    runLength == 0
+  )
   {
     currentLevel = level;
 
@@ -409,7 +383,6 @@ static inline void processSample(
 
     return;
   }
-
 
   if (
     level == currentLevel
@@ -420,7 +393,6 @@ static inline void processSample(
     return;
   }
 
-
   // ====================================================
   // EDGE
   // ====================================================
@@ -428,15 +400,12 @@ static inline void processSample(
   uint32_t completedRun =
     runLength;
 
-
   bool completedLevel =
     currentLevel;
-
 
   currentLevel = level;
 
   runLength = 1;
-
 
   // ====================================================
   // HIGH -> LOW
@@ -447,14 +416,11 @@ static inline void processSample(
     pendingHighLength =
       completedRun;
 
-
     havePendingHigh =
       true;
 
-
     return;
   }
-
 
   // ====================================================
   // LOW -> HIGH
@@ -463,8 +429,6 @@ static inline void processSample(
   uint32_t lowSamples =
     completedRun;
 
-
-  // Frame boundary
   if (
     lowSamples >= RESET_LOW_SAMPLES
   )
@@ -474,24 +438,23 @@ static inline void processSample(
     return;
   }
 
-
-  // Normal data bit
   if (havePendingHigh)
   {
     decodeHigh(
       pendingHighLength
     );
 
+    havePendingHigh =
+      false;
 
-    havePendingHigh = false;
-
-    pendingHighLength = 0;
+    pendingHighLength =
+      0;
   }
 }
 
 
 // ======================================================
-// PROCESS 16-BIT I2S WORD
+// PROCESS ONE 16-BIT WORD
 // ======================================================
 
 static inline void processWord(
@@ -507,8 +470,9 @@ static inline void processWord(
     bool level =
       (word >> bit) & 0x01;
 
-
-    processSample(level);
+    processSample(
+      level
+    );
   }
 }
 
@@ -523,11 +487,9 @@ static void i2sRxTask(
 {
   rxTaskRunning = true;
 
-
   while (true)
   {
     size_t bytesRead = 0;
-
 
     esp_err_t err =
       i2s_read(
@@ -535,11 +497,8 @@ static void i2sRxTask(
         dmaBuffer,
         sizeof(dmaBuffer),
         &bytesRead,
-
-        // Block until DMA data exists.
         portMAX_DELAY
       );
-
 
     if (
       err != ESP_OK
@@ -547,33 +506,21 @@ static void i2sRxTask(
     {
       readErrors++;
 
-      taskYIELD();
-
       continue;
     }
-
 
     if (
       bytesRead == 0
     )
     {
-      taskYIELD();
-
       continue;
     }
 
-
     dmaReads++;
-
 
     size_t words =
       bytesRead /
       sizeof(uint16_t);
-
-
-    // ==================================================
-    // PROCESS DMA DATA
-    // ==================================================
 
     for (
       size_t i = 0;
@@ -584,23 +531,7 @@ static void i2sRxTask(
       processWord(
         dmaBuffer[i]
       );
-
-
-      // ------------------------------------------------
-      // Give WLED / Arduino loop CPU time regularly.
-      // ------------------------------------------------
-
-      if (
-        (i & 0x3F) == 0x3F
-      )
-      {
-        taskYIELD();
-      }
     }
-
-
-    // Give equal/lower priority tasks a scheduling point.
-    taskYIELD();
   }
 }
 
@@ -613,49 +544,38 @@ static bool setupI2S()
 {
   i2s_config_t config = {};
 
-
   config.mode =
     (i2s_mode_t)(
       I2S_MODE_MASTER |
       I2S_MODE_RX
     );
 
-
   config.sample_rate =
     I2S_SAMPLE_RATE;
-
 
   config.bits_per_sample =
     I2S_BITS_PER_SAMPLE_16BIT;
 
-
   config.channel_format =
     I2S_CHANNEL_FMT_RIGHT_LEFT;
-
 
   config.communication_format =
     I2S_COMM_FORMAT_STAND_I2S;
 
-
   config.intr_alloc_flags =
     ESP_INTR_FLAG_LEVEL1;
-
 
   config.dma_buf_count =
     DMA_BUFFER_COUNT;
 
-
   config.dma_buf_len =
     DMA_BUFFER_LENGTH;
-
 
   config.use_apll =
     false;
 
-
   config.tx_desc_auto_clear =
     false;
-
 
   config.fixed_mclk =
     0;
@@ -672,7 +592,6 @@ static bool setupI2S()
       nullptr
     );
 
-
   if (
     err != ESP_OK
   )
@@ -685,33 +604,23 @@ static bool setupI2S()
       esp_err_to_name(err)
     );
 
-
     return false;
   }
 
 
-  // ====================================================
-  // PINS
-  // ====================================================
-
   i2s_pin_config_t pins = {};
-
 
   pins.mck_io_num =
     I2S_PIN_NO_CHANGE;
 
-
   pins.bck_io_num =
     I2S_BCK_GPIO;
-
 
   pins.ws_io_num =
     I2S_WS_GPIO;
 
-
   pins.data_out_num =
     I2S_PIN_NO_CHANGE;
-
 
   pins.data_in_num =
     DATA_INPUT_GPIO;
@@ -722,7 +631,6 @@ static bool setupI2S()
       RX_I2S_PORT,
       &pins
     );
-
 
   if (
     err != ESP_OK
@@ -736,9 +644,13 @@ static bool setupI2S()
       esp_err_to_name(err)
     );
 
-
     return false;
   }
+
+
+  i2s_zero_dma_buffer(
+    RX_I2S_PORT
+  );
 
 
   return true;
@@ -752,11 +664,10 @@ static bool setupI2S()
 static bool startRxTask()
 {
   // ====================================================
-  // IMPORTANT V6 CHANGE
+  // V5.1 CHANGE:
   //
-  // Core 1 instead of Core 0.
-  //
-  // Priority 1 instead of 3.
+  // Core remains 0.
+  // Priority is reduced from 3 to 1.
   // ====================================================
 
   BaseType_t result =
@@ -765,15 +676,15 @@ static bool startRxTask()
 
       "WS2811_I2S_RX",
 
-      6144,
+      8192,
 
       nullptr,
 
-      1,
+      1,               // Priority 1
 
       &rxTaskHandle,
 
-      1
+      0                // Core 0
     );
 
 
@@ -784,7 +695,7 @@ static bool startRxTask()
 
 
 // ======================================================
-// COPY GOOD FRAME
+// COPY LAST GOOD FRAME
 // ======================================================
 
 static void copyLastGoodFrame(
@@ -795,13 +706,11 @@ static void copyLastGoodFrame(
     &frameMux
   );
 
-
   memcpy(
     destination,
     lastGoodFrame,
     FRAME_BYTES
   );
-
 
   portEXIT_CRITICAL(
     &frameMux
@@ -810,7 +719,7 @@ static void copyLastGoodFrame(
 
 
 // ======================================================
-// PRINT GOOD FRAME
+// PRINT LAST GOOD FRAME
 // ======================================================
 
 static void printLastGoodFrame()
@@ -819,18 +728,15 @@ static void printLastGoodFrame()
     FRAME_BYTES
   ];
 
-
   copyLastGoodFrame(
     localFrame
   );
-
 
   Serial.println();
 
   Serial.println(
     "========== I2S RX FRAME =========="
   );
-
 
   for (
     uint8_t i = 0;
@@ -841,29 +747,38 @@ static void printLastGoodFrame()
     uint8_t p =
       i * 3;
 
+    Serial.print(
+      "IC"
+    );
 
-    Serial.print("IC");
-    Serial.print(i + 1);
+    Serial.print(
+      i + 1
+    );
 
+    Serial.print(
+      ": G="
+    );
 
-    Serial.print(": G=");
     Serial.print(
       localFrame[p + 0]
     );
 
+    Serial.print(
+      " R="
+    );
 
-    Serial.print(" R=");
     Serial.print(
       localFrame[p + 1]
     );
 
+    Serial.print(
+      " B="
+    );
 
-    Serial.print(" B=");
     Serial.println(
       localFrame[p + 2]
     );
   }
-
 
   Serial.println(
     "=================================="
@@ -875,7 +790,7 @@ static void printLastGoodFrame()
 // USERMOD
 // ======================================================
 
-class I2SStreamingRxV6Usermod :
+class I2SStreamingRxTaskUsermod :
   public Usermod
 {
 
@@ -888,7 +803,6 @@ public:
       0,
       sizeof(workingFrame)
     );
-
 
     memset(
       lastGoodFrame,
@@ -903,16 +817,13 @@ public:
       "================================"
     );
 
-
     Serial.println(
-      "WS2811 I2S RX STREAMING TEST V6"
+      "WS2811 I2S RX STREAMING TEST V5.1"
     );
 
-
     Serial.println(
-      "Wi-Fi friendly RX task"
+      "Dedicated FreeRTOS RX Task"
     );
-
 
     Serial.print(
       "DATA input: GPIO"
@@ -922,7 +833,6 @@ public:
       DATA_INPUT_GPIO
     );
 
-
     Serial.print(
       "I2S BCK: GPIO"
     );
@@ -930,7 +840,6 @@ public:
     Serial.println(
       I2S_BCK_GPIO
     );
-
 
     Serial.print(
       "I2S WS: GPIO"
@@ -940,31 +849,25 @@ public:
       I2S_WS_GPIO
     );
 
-
     Serial.println(
       "BCK/WS: LEAVE UNCONNECTED"
     );
-
 
     Serial.println(
       "I2S port: 1"
     );
 
-
     Serial.println(
       "Sampling: ~10 MHz"
     );
 
-
     Serial.println(
-      "RMT RX: NOT USED"
+      "RMT: NOT USED"
     );
-
 
     Serial.println(
       "LED output: DISABLED"
     );
-
 
     Serial.print(
       "Expected ICs: "
@@ -974,7 +877,6 @@ public:
       TEST_ICS
     );
 
-
     Serial.print(
       "Expected bits: "
     );
@@ -983,6 +885,17 @@ public:
       FRAME_BITS
     );
 
+    Serial.print(
+      "Reset: "
+    );
+
+    Serial.print(
+      RESET_LOW_SAMPLES
+    );
+
+    Serial.println(
+      " samples (~100 us)"
+    );
 
     Serial.print(
       "DMA: "
@@ -992,31 +905,25 @@ public:
       DMA_BUFFER_COUNT
     );
 
-
     Serial.print(
       " x "
     );
-
 
     Serial.println(
       DMA_BUFFER_LENGTH
     );
 
-
     Serial.println(
-      "RX task Core: 1"
+      "RX task core: 0"
     );
 
-
     Serial.println(
-      "RX task Priority: 1"
+      "RX task priority: 1"
     );
 
-
     Serial.println(
-      "Periodic Yield: ENABLED"
+      "Blocking i2s_read: ENABLED"
     );
-
 
     Serial.println(
       "================================"
@@ -1056,16 +963,11 @@ public:
       "RX TASK STARTED"
     );
 
-
     Serial.println(
       "================================"
     );
   }
 
-
-  // ====================================================
-  // NORMAL WLED LOOP
-  // ====================================================
 
   void loop() override
   {
@@ -1073,16 +975,12 @@ public:
       millis();
 
 
-    // ==================================================
-    // PRINT FRAME ONCE PER SECOND
-    // ==================================================
-
     if (
       now - lastFramePrintMs >= 1000
     )
     {
-      lastFramePrintMs = now;
-
+      lastFramePrintMs =
+        now;
 
       if (
         framesGood > 0
@@ -1093,15 +991,12 @@ public:
     }
 
 
-    // ==================================================
-    // STATUS EVERY 2 SECONDS
-    // ==================================================
-
     if (
       now - lastDebugMs >= 2000
     )
     {
-      lastDebugMs = now;
+      lastDebugMs =
+        now;
 
 
       uint32_t totalBad =
@@ -1118,7 +1013,6 @@ public:
         framesGood
       );
 
-
       Serial.print(
         "  Bad: "
       );
@@ -1127,6 +1021,13 @@ public:
         totalBad
       );
 
+      Serial.print(
+        "  Bad119: "
+      );
+
+      Serial.print(
+        bad119
+      );
 
       Serial.print(
         "  BadPartial: "
@@ -1136,6 +1037,48 @@ public:
         badPartial
       );
 
+      Serial.print(
+        "  BadOther: "
+      );
+
+      Serial.print(
+        badOther
+      );
+
+      Serial.print(
+        "  LastBadBits: "
+      );
+
+      Serial.print(
+        lastBadBits
+      );
+
+      Serial.print(
+        "  BadRange: "
+      );
+
+      if (
+        minBadBits == 0xFFFF
+      )
+      {
+        Serial.print(
+          "none"
+        );
+      }
+      else
+      {
+        Serial.print(
+          minBadBits
+        );
+
+        Serial.print(
+          "-"
+        );
+
+        Serial.print(
+          maxBadBits
+        );
+      }
 
       Serial.print(
         "  InvalidHigh: "
@@ -1145,7 +1088,6 @@ public:
         invalidHigh
       );
 
-
       Serial.print(
         "  LiveBits: "
       );
@@ -1153,7 +1095,6 @@ public:
       Serial.print(
         frameBitCount
       );
-
 
       Serial.print(
         "/"
@@ -1163,6 +1104,13 @@ public:
         FRAME_BITS
       );
 
+      Serial.print(
+        "  Reset: "
+      );
+
+      Serial.print(
+        resetsSeen
+      );
 
       Serial.print(
         "  DMAReads: "
@@ -1172,7 +1120,6 @@ public:
         dmaReads
       );
 
-
       Serial.print(
         "  ReadErrors: "
       );
@@ -1181,66 +1128,22 @@ public:
         readErrors
       );
 
-
       Serial.print(
         "  Task: "
       );
 
-      Serial.print(
+      Serial.println(
         rxTaskRunning ?
         "RUNNING" :
         "STOPPED"
       );
-
-
-      Serial.print(
-        "  WiFi: "
-      );
-
-
-      wl_status_t wifiStatus =
-        WiFi.status();
-
-
-      if (
-        wifiStatus == WL_CONNECTED
-      )
-      {
-        Serial.print(
-          "CONNECTED "
-        );
-
-
-        Serial.print(
-          WiFi.localIP()
-        );
-      }
-      else
-      {
-        Serial.print(
-          "NOT_CONNECTED("
-        );
-
-
-        Serial.print(
-          (int)wifiStatus
-        );
-
-
-        Serial.print(
-          ")"
-        );
-      }
-
-
-      Serial.println();
     }
   }
 
 
   uint16_t getId() override
   {
-    return 0x5052;
+    return 0x5053;
   }
 };
 
@@ -1249,10 +1152,10 @@ public:
 // REGISTER
 // ======================================================
 
-static I2SStreamingRxV6Usermod
-i2sStreamingRxV6Usermod;
+static I2SStreamingRxTaskUsermod
+i2sStreamingRxTaskUsermod;
 
 
 REGISTER_USERMOD(
-  i2sStreamingRxV6Usermod
+  i2sStreamingRxTaskUsermod
 );
