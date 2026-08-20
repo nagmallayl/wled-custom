@@ -106,16 +106,14 @@
 // RESET / FRAME BOUNDARY
 // ======================================================
 //
-// WS2811 reset LOW is far longer than normal data LOW.
-//
 // At 10 MHz:
 //
-// 30 us = 300 samples
+// 50 us = 500 samples
 //
-// We deliberately use 30 us first.
+// Increased from 300 to 500.
 // ======================================================
 
-#define RESET_LOW_SAMPLES 300
+#define RESET_LOW_SAMPLES 500
 
 
 // ======================================================
@@ -325,6 +323,31 @@ static void onResetGap()
   resetsSeen++;
 
 
+  // ====================================================
+  // IMPORTANT FIX
+  //
+  // If the last WS2811 HIGH pulse is still pending
+  // when the long RESET LOW arrives, decode it first.
+  //
+  // This should prevent ending at 119/120 bits.
+  // ====================================================
+
+  if (havePendingHigh)
+  {
+    decodeHigh(
+      pendingHighLength
+    );
+
+    havePendingHigh = false;
+
+    pendingHighLength = 0;
+  }
+
+
+  // ====================================================
+  // VALIDATE PREVIOUS FRAME
+  // ====================================================
+
   if (synced)
   {
     if (
@@ -343,6 +366,10 @@ static void onResetGap()
     }
   }
 
+
+  // ====================================================
+  // START NEW FRAME
+  // ====================================================
 
   resetFrame();
 
@@ -428,7 +455,26 @@ static void processSample(
     completedRun;
 
 
-  // Decode the bit that preceded this LOW.
+  // ----------------------------------------------------
+  // Reset / frame boundary
+  //
+  // Handle RESET before normal bit progression.
+  // ----------------------------------------------------
+
+  if (
+    lowSamples >= RESET_LOW_SAMPLES
+  )
+  {
+    onResetGap();
+
+    return;
+  }
+
+
+  // ----------------------------------------------------
+  // Normal WS2811 bit
+  // ----------------------------------------------------
+
   if (havePendingHigh)
   {
     decodeHigh(
@@ -437,15 +483,9 @@ static void processSample(
 
     havePendingHigh =
       false;
-  }
 
-
-  // Reset / frame boundary
-  if (
-    lowSamples >= RESET_LOW_SAMPLES
-  )
-  {
-    onResetGap();
+    pendingHighLength =
+      0;
   }
 }
 
@@ -456,10 +496,6 @@ static void processSample(
 //
 // Each 16-bit I2S word contains 16 consecutive
 // serial samples from DATA_INPUT_GPIO.
-//
-// Start with MSB first.
-// If diagnostic later proves bit order reversed,
-// we only change this small function.
 // ======================================================
 
 static void processWord(
@@ -630,7 +666,7 @@ public:
     );
 
     Serial.println(
-      "WS2811 I2S RX STREAMING TEST"
+      "WS2811 I2S RX STREAMING TEST V2"
     );
 
 
@@ -701,6 +737,24 @@ public:
 
     Serial.println(
       FRAME_BITS
+    );
+
+
+    Serial.print(
+      "Reset threshold: "
+    );
+
+    Serial.print(
+      RESET_LOW_SAMPLES
+    );
+
+    Serial.println(
+      " samples"
+    );
+
+
+    Serial.println(
+      "Pending-last-bit fix: ENABLED"
     );
 
 
@@ -853,7 +907,7 @@ public:
 
   uint16_t getId() override
   {
-    return 0x5047;
+    return 0x5048;
   }
 };
 
