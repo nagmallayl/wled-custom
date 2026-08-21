@@ -5,8 +5,8 @@
 #include "esp_wifi.h"
 
 // ======================================================
-// WLED DUAL ESP-NOW LED RX V3
-// FULL SYNC ONLY
+// WLED DUAL ESP-NOW LED RX V4
+// TIMESTAMP MATCHING
 //
 // WLED 16.0.0
 // ESP32 Classic / GL-C-016WL-D
@@ -22,11 +22,11 @@
 // Incoming packet order = GRB
 // WLED physical Color Order = BRG
 //
-// IMPORTANT:
-// - NO partial shows
-// - NO synchronization timeout
-// - strip.show() ONLY when BOTH lines have a new frame
-// - WLED resumes only after 10 seconds without packets
+// V4:
+// - Full Sync only
+// - Compare txMicros between Line0 / Line1
+// - Show only when timestamps are close enough
+// - Drop the older frame if timestamps differ too much
 // ======================================================
 
 
@@ -45,10 +45,13 @@
 #define SIGNAL_TIMEOUT_MS 10000
 #define REALTIME_LOCK_MS  2000
 
+// Maximum allowed timestamp difference between
+// Line0 and Line1 before considering one frame too old.
+#define MAX_TIMESTAMP_DELTA_US 20000
+
 
 // ======================================================
 // PACKET FORMAT
-// Must match TX V1.3
 // ======================================================
 
 struct __attribute__((packed)) LedPacket
@@ -91,6 +94,23 @@ static bool lineReady[2] =
 
 
 // ======================================================
+// TIMESTAMP / FRAME INFO
+// ======================================================
+
+static uint32_t lineTxMicros[2] =
+{
+  0,
+  0
+};
+
+static uint32_t lineFrameId[2] =
+{
+  0,
+  0
+};
+
+
+// ======================================================
 // ESP-NOW / REALTIME STATE
 // ======================================================
 
@@ -122,6 +142,15 @@ static uint32_t framesApplied[2] =
 };
 
 static uint32_t synchronizedShows = 0;
+
+static uint32_t timestampMatched = 0;
+
+static uint32_t droppedOldLine0 = 0;
+static uint32_t droppedOldLine1 = 0;
+
+static uint32_t maxObservedDeltaUs = 0;
+static uint32_t lastObservedDeltaUs = 0;
+
 
 static uint32_t badMagic = 0;
 static uint32_t badVersion = 0;
@@ -177,15 +206,28 @@ static uint16_t calculateCRC16(
 {
   uint16_t crc = 0xFFFF;
 
-  for (size_t i = 0; i < length; i++)
+  for (
+    size_t i = 0;
+    i < length;
+    i++
+  )
   {
-    crc ^= (uint16_t)data[i] << 8;
+    crc ^=
+      (uint16_t)data[i] << 8;
 
-    for (uint8_t bit = 0; bit < 8; bit++)
+    for (
+      uint8_t bit = 0;
+      bit < 8;
+      bit++
+    )
     {
-      if (crc & 0x8000)
+      if (
+        crc & 0x8000
+      )
       {
-        crc = (crc << 1) ^ 0x1021;
+        crc =
+          (crc << 1) ^
+          0x1021;
       }
       else
       {
@@ -210,19 +252,29 @@ static void onEspNowReceive(
 {
   packetsReceived++;
 
-  if (len != sizeof(LedPacket))
+
+  if (
+    len != sizeof(LedPacket)
+  )
   {
     badLength++;
+
     return;
   }
 
-  if (rxQueue == nullptr)
+
+  if (
+    rxQueue == nullptr
+  )
   {
     queueDrops++;
+
     return;
   }
 
+
   RxQueueItem item;
+
 
   memcpy(
     &item.packet,
@@ -230,11 +282,13 @@ static void onEspNowReceive(
     sizeof(LedPacket)
   );
 
+
   memcpy(
     item.senderMac,
     macAddress,
     6
   );
+
 
   if (
     xQueueSend(
@@ -255,10 +309,13 @@ static void onEspNowReceive(
 
 static bool createRxQueue()
 {
-  if (rxQueue != nullptr)
+  if (
+    rxQueue != nullptr
+  )
   {
     return true;
   }
+
 
   rxQueue =
     xQueueCreate(
@@ -266,7 +323,10 @@ static bool createRxQueue()
       sizeof(RxQueueItem)
     );
 
-  if (rxQueue == nullptr)
+
+  if (
+    rxQueue == nullptr
+  )
   {
     Serial.println(
       "RX QUEUE CREATE FAILED"
@@ -275,9 +335,11 @@ static bool createRxQueue()
     return false;
   }
 
+
   Serial.println(
     "RX QUEUE READY"
   );
+
 
   return true;
 }
@@ -289,10 +351,13 @@ static bool createRxQueue()
 
 static bool startEspNow()
 {
-  if (espNowReady)
+  if (
+    espNowReady
+  )
   {
     return true;
   }
+
 
   if (
     WiFi.status() !=
@@ -302,21 +367,25 @@ static bool startEspNow()
     return false;
   }
 
+
   Serial.println();
 
   Serial.println(
     "Wi-Fi ready -> starting ESP-NOW..."
   );
 
+
   uint8_t channel = 0;
 
   wifi_second_chan_t secondary =
     WIFI_SECOND_CHAN_NONE;
 
+
   esp_wifi_get_channel(
     &channel,
     &secondary
   );
+
 
   Serial.print(
     "Wi-Fi Channel: "
@@ -326,10 +395,14 @@ static bool startEspNow()
     channel
   );
 
+
   esp_err_t err =
     esp_now_init();
 
-  if (err != ESP_OK)
+
+  if (
+    err != ESP_OK
+  )
   {
     Serial.print(
       "ESP-NOW INIT ERROR: "
@@ -342,12 +415,16 @@ static bool startEspNow()
     return false;
   }
 
+
   err =
     esp_now_register_recv_cb(
       onEspNowReceive
     );
 
-  if (err != ESP_OK)
+
+  if (
+    err != ESP_OK
+  )
   {
     Serial.print(
       "ESP-NOW CALLBACK ERROR: "
@@ -357,16 +434,20 @@ static bool startEspNow()
       esp_err_to_name(err)
     );
 
+
     esp_now_deinit();
 
     return false;
   }
 
+
   espNowReady = true;
 
+
   Serial.println(
-    "ESP-NOW DUAL RX V3 READY"
+    "ESP-NOW DUAL RX V4 READY"
   );
+
 
   return true;
 }
@@ -381,13 +462,16 @@ static void processSequence(
   uint32_t frameId
 )
 {
-  if (lastFrameId[lineId] == 0)
+  if (
+    lastFrameId[lineId] == 0
+  )
   {
     lastFrameId[lineId] =
       frameId;
 
     return;
   }
+
 
   if (
     frameId ==
@@ -400,14 +484,17 @@ static void processSequence(
     return;
   }
 
+
   if (
     frameId ==
     lastFrameId[lineId]
   )
   {
     duplicateFrames[lineId]++;
+
     return;
   }
+
 
   if (
     frameId >
@@ -419,11 +506,13 @@ static void processSequence(
       lastFrameId[lineId] -
       1;
 
+
     lastFrameId[lineId] =
       frameId;
 
     return;
   }
+
 
   outOfOrderFrames[lineId]++;
 }
@@ -441,23 +530,16 @@ static void processPacket(
     item.packet;
 
 
-  // ----------------------------------------------------
-  // MAGIC
-  // ----------------------------------------------------
-
   if (
     packet.magic !=
     PACKET_MAGIC
   )
   {
     badMagic++;
+
     return;
   }
 
-
-  // ----------------------------------------------------
-  // VERSION
-  // ----------------------------------------------------
 
   if (
     packet.version !=
@@ -465,24 +547,20 @@ static void processPacket(
   )
   {
     badVersion++;
+
     return;
   }
 
 
-  // ----------------------------------------------------
-  // LINE ID
-  // ----------------------------------------------------
-
-  if (packet.lineId > 1)
+  if (
+    packet.lineId > 1
+  )
   {
     badLine++;
+
     return;
   }
 
-
-  // ----------------------------------------------------
-  // IC COUNT
-  // ----------------------------------------------------
 
   if (
     packet.icCount !=
@@ -490,13 +568,10 @@ static void processPacket(
   )
   {
     badIcCount++;
+
     return;
   }
 
-
-  // ----------------------------------------------------
-  // CRC
-  // ----------------------------------------------------
 
   uint16_t calculatedCRC =
     calculateCRC16(
@@ -505,12 +580,14 @@ static void processPacket(
       sizeof(packet.crc)
     );
 
+
   if (
     calculatedCRC !=
     packet.crc
   )
   {
     badCRC++;
+
     return;
   }
 
@@ -522,7 +599,9 @@ static void processPacket(
   uint8_t lineId =
     packet.lineId;
 
+
   packetsGood[lineId]++;
+
 
   processSequence(
     lineId,
@@ -530,21 +609,24 @@ static void processPacket(
   );
 
 
-  // ----------------------------------------------------
-  // Store newest GOOD frame for this line.
-  //
-  // If several Line0 frames arrive before Line1,
-  // we keep only the newest Line0 frame.
-  // ----------------------------------------------------
-
   memcpy(
     lineFrame[lineId],
     packet.data,
     FRAME_BYTES
   );
 
+
+  lineTxMicros[lineId] =
+    packet.txMicros;
+
+
+  lineFrameId[lineId] =
+    packet.frameId;
+
+
   lineReady[lineId] =
     true;
+
 
   lastPacketMillis =
     millis();
@@ -557,12 +639,16 @@ static void processPacket(
 
 static void processRxQueue()
 {
-  if (rxQueue == nullptr)
+  if (
+    rxQueue == nullptr
+  )
   {
     return;
   }
 
+
   RxQueueItem item;
+
 
   while (
     xQueueReceive(
@@ -580,7 +666,7 @@ static void processRxQueue()
 
 
 // ======================================================
-// COPY ONE LINE TO WLED BUFFER
+// COPY ONE LINE TO WLED
 // ======================================================
 
 static void copyLineToWLED(
@@ -602,26 +688,17 @@ static void copyLineToWLED(
       i * 3;
 
 
-    // Incoming packet:
-    //
-    // byte 0 = G
-    // byte 1 = R
-    // byte 2 = B
-
     uint8_t inputG =
       lineFrame[lineId][p + 0];
+
 
     uint8_t inputR =
       lineFrame[lineId][p + 1];
 
+
     uint8_t inputB =
       lineFrame[lineId][p + 2];
 
-
-    // WLED logical RGB.
-    //
-    // Physical BRG conversion is handled
-    // by WLED LED Preferences.
 
     strip.setPixelColor(
       pixelOffset + i,
@@ -637,19 +714,59 @@ static void copyLineToWLED(
 
 
 // ======================================================
-// FULL SYNC OUTPUT
+// SAFE ABS DIFFERENCE FOR uint32_t MICROS
+//
+// Works correctly for normal small deltas even when
+// micros() wraps around.
 // ======================================================
 
-static void updateFullSyncOutput()
+static uint32_t getTimestampDelta(
+  uint32_t a,
+  uint32_t b
+)
 {
-  // ====================================================
-  // V3 RULE:
-  //
-  // NEVER update only one line.
-  //
-  // BOTH must have a fresh GOOD frame.
-  // ====================================================
+  int32_t signedDelta =
+    (int32_t)(a - b);
 
+
+  if (
+    signedDelta < 0
+  )
+  {
+    return
+      (uint32_t)(-signedDelta);
+  }
+
+
+  return
+    (uint32_t)signedDelta;
+}
+
+
+// ======================================================
+// DETERMINE WHICH TIMESTAMP IS OLDER
+//
+// Wrap-safe comparison for differences below ~35 min,
+// which is far beyond what we need here.
+// ======================================================
+
+static bool timestampIsOlder(
+  uint32_t a,
+  uint32_t b
+)
+{
+  return
+    (int32_t)(a - b) < 0;
+}
+
+
+// ======================================================
+// TIMESTAMP MATCHED FULL-SYNC OUTPUT
+// ======================================================
+
+static void updateTimestampMatchedOutput()
+{
+  // Need a fresh frame from BOTH lines.
   if (
     !lineReady[0] ||
     !lineReady[1]
@@ -659,53 +776,114 @@ static void updateFullSyncOutput()
   }
 
 
-  // ====================================================
-  // KEEP WLED IN REALTIME MODE
-  // ====================================================
-
-  realtimeLock(
-    REALTIME_LOCK_MS,
-    REALTIME_MODE_UDP
-  );
-
-  realtimeActive =
-    true;
+  uint32_t t0 =
+    lineTxMicros[0];
 
 
-  // ====================================================
-  // FIRST:
-  // copy BOTH frames to WLED buffers
-  // ====================================================
-
-  copyLineToWLED(
-    0
-  );
-
-  copyLineToWLED(
-    1
-  );
+  uint32_t t1 =
+    lineTxMicros[1];
 
 
-  // ====================================================
-  // THEN:
-  // physical output once for both buses
-  // ====================================================
+  uint32_t deltaUs =
+    getTimestampDelta(
+      t0,
+      t1
+    );
 
-  strip.show();
+
+  lastObservedDeltaUs =
+    deltaUs;
 
 
-  synchronizedShows++;
+  if (
+    deltaUs >
+    maxObservedDeltaUs
+  )
+  {
+    maxObservedDeltaUs =
+      deltaUs;
+  }
 
 
   // ====================================================
-  // BOTH NEW FRAMES HAVE NOW BEEN CONSUMED
+  // MATCHED
   // ====================================================
 
-  lineReady[0] =
-    false;
+  if (
+    deltaUs <=
+    MAX_TIMESTAMP_DELTA_US
+  )
+  {
+    realtimeLock(
+      REALTIME_LOCK_MS,
+      REALTIME_MODE_UDP
+    );
 
-  lineReady[1] =
-    false;
+
+    realtimeActive =
+      true;
+
+
+    copyLineToWLED(
+      0
+    );
+
+
+    copyLineToWLED(
+      1
+    );
+
+
+    strip.show();
+
+
+    synchronizedShows++;
+
+    timestampMatched++;
+
+
+    lineReady[0] =
+      false;
+
+
+    lineReady[1] =
+      false;
+
+
+    return;
+  }
+
+
+  // ====================================================
+  // NOT MATCHED
+  //
+  // Drop OLDER frame only.
+  //
+  // Keep newer frame pending and wait for a newer
+  // counterpart from the other line.
+  // ====================================================
+
+  if (
+    timestampIsOlder(
+      t0,
+      t1
+    )
+  )
+  {
+    lineReady[0] =
+      false;
+
+
+    droppedOldLine0++;
+  }
+  else
+  {
+    lineReady[1] =
+      false;
+
+
+    droppedOldLine1++;
+  }
 }
 
 
@@ -715,7 +893,9 @@ static void updateFullSyncOutput()
 
 static void updateRealtimeTimeout()
 {
-  if (!realtimeActive)
+  if (
+    !realtimeActive
+  )
   {
     return;
   }
@@ -730,11 +910,14 @@ static void updateRealtimeTimeout()
     realtimeActive =
       false;
 
+
     lineReady[0] =
       false;
 
+
     lineReady[1] =
       false;
+
 
     exitRealtime();
 
@@ -806,11 +989,74 @@ static void printStatus()
 
 
   Serial.print(
-    "FullSyncShows="
+    "MatchedShows="
+  );
+
+  Serial.print(
+    synchronizedShows
+  );
+
+
+  Serial.print(
+    " TimestampMatched="
   );
 
   Serial.println(
-    synchronizedShows
+    timestampMatched
+  );
+
+
+  Serial.print(
+    "DropOldL0="
+  );
+
+  Serial.print(
+    droppedOldLine0
+  );
+
+
+  Serial.print(
+    " DropOldL1="
+  );
+
+  Serial.println(
+    droppedOldLine1
+  );
+
+
+  Serial.print(
+    "LastDeltaUs="
+  );
+
+  Serial.print(
+    lastObservedDeltaUs
+  );
+
+
+  Serial.print(
+    " MaxDeltaUs="
+  );
+
+  Serial.println(
+    maxObservedDeltaUs
+  );
+
+
+  Serial.print(
+    "Current Frames: L0="
+  );
+
+  Serial.print(
+    lineFrameId[0]
+  );
+
+
+  Serial.print(
+    " L1="
+  );
+
+  Serial.println(
+    lineFrameId[1]
   );
 
 
@@ -889,6 +1135,7 @@ static void printStatus()
     duplicateFrames[0]
   );
 
+
   Serial.print(
     " L1="
   );
@@ -905,6 +1152,7 @@ static void printStatus()
   Serial.print(
     outOfOrderFrames[0]
   );
+
 
   Serial.print(
     " L1="
@@ -943,6 +1191,7 @@ static void printStatus()
 
     uint8_t channel = 0;
 
+
     wifi_second_chan_t secondary =
       WIFI_SECOND_CHAN_NONE;
 
@@ -957,6 +1206,7 @@ static void printStatus()
       Serial.print(
         " CH="
       );
+
 
       Serial.print(
         channel
@@ -979,7 +1229,7 @@ static void printStatus()
 // USERMOD
 // ======================================================
 
-class DualEspNowFullSyncReceiver :
+class DualEspNowTimestampReceiver :
   public Usermod
 {
 
@@ -1000,69 +1250,96 @@ public:
       "======================================"
     );
 
-    Serial.println(
-      "WLED DUAL ESP-NOW LED RX V3"
-    );
 
     Serial.println(
-      "FULL SYNC ONLY"
+      "WLED DUAL ESP-NOW LED RX V4"
     );
+
+
+    Serial.println(
+      "TIMESTAMP MATCHING"
+    );
+
 
     Serial.println(
       "======================================"
     );
 
+
     Serial.println(
       "lineId 0 -> GPIO16 / pixels 0..37"
     );
+
 
     Serial.println(
       "lineId 1 -> GPIO2 / pixels 38..75"
     );
 
+
     Serial.println(
       "38 IC per line"
     );
+
 
     Serial.println(
       "Incoming = GRB"
     );
 
+
     Serial.println(
       "WLED Color Order = BRG"
     );
+
 
     Serial.println(
       "Partial Show = DISABLED"
     );
 
-    Serial.println(
-      "Sync timeout = DISABLED"
-    );
 
     Serial.println(
-      "Output requires BOTH lines"
+      "Full Sync = ENABLED"
     );
+
+
+    Serial.print(
+      "Max timestamp delta = "
+    );
+
+
+    Serial.print(
+      MAX_TIMESTAMP_DELTA_US
+    );
+
+
+    Serial.println(
+      " us"
+    );
+
 
     Serial.print(
       "Signal timeout = "
     );
 
+
     Serial.print(
       SIGNAL_TIMEOUT_MS
     );
+
 
     Serial.println(
       " ms"
     );
 
+
     Serial.print(
       "Packet bytes = "
     );
 
+
     Serial.println(
       sizeof(LedPacket)
     );
+
 
     Serial.println(
       "======================================"
@@ -1104,25 +1381,24 @@ public:
         lastInitAttemptMs =
           now;
 
+
         startEspNow();
       }
     }
 
 
     // ==================================================
-    // RECEIVE
+    // RECEIVE + TIMESTAMP MATCHING
     // ==================================================
 
-    if (espNowReady)
+    if (
+      espNowReady
+    )
     {
       processRxQueue();
 
 
-      // ================================================
-      // V3 FULL-SYNC OUTPUT
-      // ================================================
-
-      updateFullSyncOutput();
+      updateTimestampMatchedOutput();
     }
 
 
@@ -1142,6 +1418,7 @@ public:
       lastStatusMillis =
         now;
 
+
       printStatus();
     }
   }
@@ -1154,33 +1431,49 @@ public:
     JsonObject info =
       root["u"]
       .createNestedObject(
-        "Dual FullSync ESP-NOW RX"
+        "Dual Timestamp ESP-NOW RX"
       );
 
 
     info["ready"] =
       espNowReady;
 
+
     info["l0_rx"] =
       packetsGood[0];
+
 
     info["l1_rx"] =
       packetsGood[1];
 
-    info["full_sync_shows"] =
-      synchronizedShows;
 
-    info["l0_lost"] =
-      lostFrames[0];
+    info["matched"] =
+      timestampMatched;
 
-    info["l1_lost"] =
-      lostFrames[1];
+
+    info["drop_l0"] =
+      droppedOldLine0;
+
+
+    info["drop_l1"] =
+      droppedOldLine1;
+
+
+    info["last_delta_us"] =
+      lastObservedDeltaUs;
+
+
+    info["max_delta_us"] =
+      maxObservedDeltaUs;
+
 
     info["crc_bad"] =
       badCRC;
 
+
     info["queue_drop"] =
       queueDrops;
+
 
     info["realtime"] =
       realtimeActive;
@@ -1189,7 +1482,7 @@ public:
 
   uint16_t getId() override
   {
-    return 0x5064;
+    return 0x5065;
   }
 };
 
@@ -1198,10 +1491,10 @@ public:
 // REGISTER USERMOD
 // ======================================================
 
-static DualEspNowFullSyncReceiver
-dualEspNowFullSyncReceiver;
+static DualEspNowTimestampReceiver
+dualEspNowTimestampReceiver;
 
 
 REGISTER_USERMOD(
-  dualEspNowFullSyncReceiver
+  dualEspNowTimestampReceiver
 );
