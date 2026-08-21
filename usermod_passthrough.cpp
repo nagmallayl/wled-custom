@@ -5,7 +5,7 @@
 #include "esp_wifi.h"
 
 // ======================================================
-// WLED DUAL ESP-NOW LED RX V2.1
+// WLED DUAL ESP-NOW LED RX V2.2
 // IMPROVED SYNCHRONIZATION
 //
 // WLED 16.0.0
@@ -22,8 +22,8 @@
 // Incoming packet order = GRB
 // WLED physical Color Order = BRG
 //
-// V2.1:
-// - Sync timeout: 80 ms
+// V2.2:
+// - Sync timeout: 100 ms
 // - Sync timer starts only once per pending pair
 // - Both lines updated before one strip.show()
 // ======================================================
@@ -45,7 +45,7 @@
 
 #define REALTIME_LOCK_MS 2000
 
-#define LINE_SYNC_TIMEOUT_MS 80
+#define LINE_SYNC_TIMEOUT_MS 100
 
 
 // ======================================================
@@ -465,7 +465,7 @@ static bool startEspNow()
 
 
   Serial.println(
-    "ESP-NOW DUAL RX V2.1 READY"
+    "ESP-NOW DUAL RX V2.2 READY"
   );
 
 
@@ -554,10 +554,6 @@ static void processPacket(
     item.packet;
 
 
-  // ----------------------------------------------------
-  // MAGIC
-  // ----------------------------------------------------
-
   if (
     packet.magic !=
     PACKET_MAGIC
@@ -568,10 +564,6 @@ static void processPacket(
     return;
   }
 
-
-  // ----------------------------------------------------
-  // VERSION
-  // ----------------------------------------------------
 
   if (
     packet.version !=
@@ -584,10 +576,6 @@ static void processPacket(
   }
 
 
-  // ----------------------------------------------------
-  // LINE
-  // ----------------------------------------------------
-
   if (
     packet.lineId > 1
   )
@@ -597,10 +585,6 @@ static void processPacket(
     return;
   }
 
-
-  // ----------------------------------------------------
-  // IC COUNT
-  // ----------------------------------------------------
 
   if (
     packet.icCount !=
@@ -612,10 +596,6 @@ static void processPacket(
     return;
   }
 
-
-  // ----------------------------------------------------
-  // CRC
-  // ----------------------------------------------------
 
   uint16_t calculatedCRC =
     calculateCRC16(
@@ -635,10 +615,6 @@ static void processPacket(
     return;
   }
 
-
-  // ====================================================
-  // GOOD PACKET
-  // ====================================================
 
   uint8_t lineId =
     packet.lineId;
@@ -664,10 +640,6 @@ static void processPacket(
     millis();
 
 
-  // ====================================================
-  // FRAME READY
-  // ====================================================
-
   lineReady[lineId] =
     true;
 
@@ -680,15 +652,7 @@ static void processPacket(
     now;
 
 
-  // ====================================================
-  // V2.1 SYNC FIX
-  //
-  // Start synchronization timer only once.
-  //
-  // A new frame from the SAME line will update its
-  // buffer, but WILL NOT restart the 80ms timer.
-  // ====================================================
-
+  // Start sync window only once for this pending pair.
   if (
     syncWindowStartMs == 0
   )
@@ -755,29 +719,16 @@ static void copyLineToWLED(
 
 
     uint8_t inputG =
-      lineFrame[lineId][
-        p + 0
-      ];
+      lineFrame[lineId][p + 0];
 
 
     uint8_t inputR =
-      lineFrame[lineId][
-        p + 1
-      ];
+      lineFrame[lineId][p + 1];
 
 
     uint8_t inputB =
-      lineFrame[lineId][
-        p + 2
-      ];
+      lineFrame[lineId][p + 2];
 
-
-    // Incoming data = GRB
-    //
-    // WLED setPixelColor() expects logical RGB.
-    //
-    // WLED itself handles the physical BRG order
-    // configured in LED Preferences.
 
     strip.setPixelColor(
       pixelOffset + i,
@@ -825,10 +776,6 @@ static void updateSynchronizedOutput()
     );
 
 
-  // ====================================================
-  // WAIT FOR THE SECOND LINE
-  // ====================================================
-
   if (
     !bothReady &&
     !syncTimeout
@@ -837,10 +784,6 @@ static void updateSynchronizedOutput()
     return;
   }
 
-
-  // ====================================================
-  // KEEP WLED IN REALTIME MODE
-  // ====================================================
 
   realtimeLock(
     REALTIME_LOCK_MS,
@@ -851,10 +794,6 @@ static void updateSynchronizedOutput()
   realtimeActive =
     true;
 
-
-  // ====================================================
-  // UPDATE BOTH WLED BUFFERS FIRST
-  // ====================================================
 
   if (
     lineReady[0]
@@ -876,10 +815,6 @@ static void updateSynchronizedOutput()
   }
 
 
-  // ====================================================
-  // ONLY ONE SHOW FOR BOTH STRIPS
-  // ====================================================
-
   strip.show();
 
 
@@ -897,10 +832,6 @@ static void updateSynchronizedOutput()
     timeoutShows++;
   }
 
-
-  // ====================================================
-  // PAIR CONSUMED
-  // ====================================================
 
   lineReady[0] =
     false;
@@ -962,7 +893,7 @@ static void updateRealtimeTimeout()
 
 
 // ======================================================
-// PRINT STATUS
+// STATUS
 // ======================================================
 
 static void printStatus()
@@ -974,26 +905,21 @@ static void printStatus()
     "L0 RX="
   );
 
-
   Serial.print(
     packetsGood[0]
   );
-
 
   Serial.print(
     " Applied="
   );
 
-
   Serial.print(
     framesShown[0]
   );
 
-
   Serial.print(
     " Lost="
   );
-
 
   Serial.print(
     lostFrames[0]
@@ -1004,26 +930,21 @@ static void printStatus()
     " | L1 RX="
   );
 
-
   Serial.print(
     packetsGood[1]
   );
-
 
   Serial.print(
     " Applied="
   );
 
-
   Serial.print(
     framesShown[1]
   );
 
-
   Serial.print(
     " Lost="
   );
-
 
   Serial.println(
     lostFrames[1]
@@ -1034,26 +955,21 @@ static void printStatus()
     "Shows="
   );
 
-
   Serial.print(
     synchronizedShows
   );
-
 
   Serial.print(
     " FullSync="
   );
 
-
   Serial.print(
     fullSyncShows
   );
 
-
   Serial.print(
     " TimeoutShow="
   );
-
 
   Serial.println(
     timeoutShows
@@ -1064,46 +980,37 @@ static void printStatus()
     "TotalRX="
   );
 
-
   Serial.print(
     packetsReceived
   );
-
 
   Serial.print(
     " CRCBad="
   );
 
-
   Serial.print(
     badCRC
   );
-
 
   Serial.print(
     " BadLen="
   );
 
-
   Serial.print(
     badLength
   );
-
 
   Serial.print(
     " BadLine="
   );
 
-
   Serial.print(
     badLine
   );
 
-
   Serial.print(
     " QueueDrop="
   );
-
 
   Serial.println(
     queueDrops
@@ -1114,18 +1021,15 @@ static void printStatus()
     "Pending: L0="
   );
 
-
   Serial.print(
     lineReady[0] ?
     "YES" :
     "NO"
   );
 
-
   Serial.print(
     " L1="
   );
-
 
   Serial.println(
     lineReady[1] ?
@@ -1138,13 +1042,11 @@ static void printStatus()
     "Mode="
   );
 
-
   Serial.print(
     realtimeActive ?
     "REALTIME" :
     "WLED"
   );
-
 
   Serial.print(
     " WiFi="
@@ -1179,7 +1081,6 @@ static void printStatus()
       Serial.print(
         " CH="
       );
-
 
       Serial.print(
         channel
@@ -1223,86 +1124,69 @@ public:
       "======================================"
     );
 
-
     Serial.println(
-      "WLED DUAL ESP-NOW LED RX V2.1"
+      "WLED DUAL ESP-NOW LED RX V2.2"
     );
 
-
     Serial.println(
-      "IMPROVED SYNCHRONIZATION"
+      "100ms SYNCHRONIZATION"
     );
-
 
     Serial.println(
       "======================================"
     );
 
-
     Serial.println(
       "lineId 0 -> GPIO16 / pixels 0..37"
     );
-
 
     Serial.println(
       "lineId 1 -> GPIO2 / pixels 38..75"
     );
 
-
     Serial.println(
       "38 IC per line"
     );
-
 
     Serial.println(
       "Incoming = GRB"
     );
 
-
     Serial.println(
       "WLED Color Order = BRG"
     );
-
 
     Serial.print(
       "Sync timeout = "
     );
 
-
     Serial.print(
       LINE_SYNC_TIMEOUT_MS
     );
 
-
     Serial.println(
       " ms"
     );
-
 
     Serial.print(
       "Signal timeout = "
     );
 
-
     Serial.print(
       SIGNAL_TIMEOUT_MS
     );
-
 
     Serial.println(
       " ms"
     );
 
-
     Serial.print(
       "Packet bytes = "
     );
 
-
     Serial.println(
       sizeof(LedPacket)
     );
-
 
     Serial.println(
       "======================================"
@@ -1323,10 +1207,6 @@ public:
     uint32_t now =
       millis();
 
-
-    // ==================================================
-    // START ESP-NOW AFTER WLED WIFI
-    // ==================================================
 
     if (
       !espNowReady &&
@@ -1350,10 +1230,6 @@ public:
     }
 
 
-    // ==================================================
-    // RX + SYNCHRONIZED OUTPUT
-    // ==================================================
-
     if (
       espNowReady
     )
@@ -1367,10 +1243,6 @@ public:
 
     updateRealtimeTimeout();
 
-
-    // ==================================================
-    // STATUS
-    // ==================================================
 
     if (
       now -
@@ -1401,34 +1273,26 @@ public:
     info["ready"] =
       espNowReady;
 
-
     info["l0_rx"] =
       packetsGood[0];
-
 
     info["l1_rx"] =
       packetsGood[1];
 
-
     info["shows"] =
       synchronizedShows;
-
 
     info["full_sync"] =
       fullSyncShows;
 
-
     info["timeout_show"] =
       timeoutShows;
-
 
     info["crc_bad"] =
       badCRC;
 
-
     info["queue_drop"] =
       queueDrops;
-
 
     info["realtime"] =
       realtimeActive;
@@ -1437,7 +1301,7 @@ public:
 
   uint16_t getId() override
   {
-    return 0x5062;
+    return 0x5063;
   }
 };
 
