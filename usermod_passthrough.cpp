@@ -5,25 +5,25 @@
 #include "esp_wifi.h"
 
 // ======================================================
-// WLED DUAL ESP-NOW LED RECEIVER V1
+// WLED DUAL ESP-NOW LED RX V2
+// SYNCHRONIZED OUTPUT
 //
 // WLED 16.0.0
 // ESP32 Classic / GL-C-016WL-D
 //
 // lineId 0:
-//   38 IC -> WLED pixels 0..37 -> GPIO16
+//   pixels 0..37  -> GPIO16
 //
 // lineId 1:
-//   38 IC -> WLED pixels 38..75 -> GPIO2
+//   pixels 38..75 -> GPIO2
 //
-// Incoming WS2811 byte order:
-//   G R B
+// 38 IC per line
 //
-// WLED logical API:
-//   R G B
+// Incoming packet order = GRB
+// WLED physical Color Order = BRG
 //
-// WLED physical Color Order:
-//   BRG
+// Main V2 change:
+// WAIT FOR BOTH LINES, THEN strip.show() ONCE.
 // ======================================================
 
 
@@ -32,28 +32,25 @@
 // ======================================================
 
 #define ICS_PER_LINE 38
-
-#define FRAME_BYTES \
-  (ICS_PER_LINE * 3)
-
-#define TOTAL_WLED_PIXELS \
-  (ICS_PER_LINE * 2)
+#define FRAME_BYTES (ICS_PER_LINE * 3)
 
 #define PACKET_MAGIC   0x2811
 #define PACKET_VERSION 2
 
-#define RX_QUEUE_LENGTH 16
+#define RX_QUEUE_LENGTH 20
 
+// Don't return to WLED unless transmitter really stops.
 #define SIGNAL_TIMEOUT_MS 10000
-#define REALTIME_LOCK_MS  1000
+
+#define REALTIME_LOCK_MS  2000
+
+// Maximum wait for the other line.
+// 50 ms ~= suitable for ~20 fps.
+#define LINE_SYNC_TIMEOUT_MS 50
 
 
 // ======================================================
-// PACKET
-//
-// MUST MATCH DUAL TX V1
-//
-// total = 129 bytes
+// PACKET FORMAT
 // ======================================================
 
 struct __attribute__((packed))
@@ -71,16 +68,14 @@ LedPacket
 
   uint32_t txMicros;
 
-  uint8_t data[
-    FRAME_BYTES
-  ];
+  uint8_t data[FRAME_BYTES];
 
   uint16_t crc;
 };
 
 
 // ======================================================
-// QUEUE ITEM
+// RX QUEUE
 // ======================================================
 
 struct RxQueueItem
@@ -91,53 +86,52 @@ struct RxQueueItem
 };
 
 
-static QueueHandle_t rxQueue =
-  nullptr;
+static QueueHandle_t rxQueue = nullptr;
 
 
 // ======================================================
-// FRAME BUFFERS
+// LINE BUFFERS
 // ======================================================
 
 static uint8_t lineFrame[2][FRAME_BYTES];
 
-static bool lineFrameReady[2] =
+static bool lineReady[2] =
 {
   false,
   false
 };
 
 
-// ======================================================
-// ESP-NOW STATE
-// ======================================================
+// Last time each line received a valid packet.
+static uint32_t lineReceivedMs[2] =
+{
+  0,
+  0
+};
 
-static bool espNowReady =
-  false;
 
-static bool realtimeActive =
-  false;
-
-static uint32_t lastInitAttemptMs =
-  0;
-
-static uint32_t lastPacketMillis =
-  0;
+// Used to start synchronization window.
+static uint32_t syncWindowStartMs = 0;
 
 
 // ======================================================
-// RX STATS
+// ESP-NOW / REALTIME STATE
 // ======================================================
 
-static volatile uint32_t packetsReceived =
-  0;
+static bool espNowReady = false;
+static bool realtimeActive = false;
 
-static volatile uint32_t badLength =
-  0;
+static uint32_t lastInitAttemptMs = 0;
+static uint32_t lastPacketMillis = 0;
 
-static volatile uint32_t queueDrops =
-  0;
 
+// ======================================================
+// RX STATISTICS
+// ======================================================
+
+static volatile uint32_t packetsReceived = 0;
+static volatile uint32_t badLength = 0;
+static volatile uint32_t queueDrops = 0;
 
 static uint32_t packetsGood[2] =
 {
@@ -152,24 +146,27 @@ static uint32_t framesShown[2] =
 };
 
 
-static uint32_t badMagic =
-  0;
+// Number of actual strip.show() calls.
+static uint32_t synchronizedShows = 0;
 
-static uint32_t badVersion =
-  0;
 
-static uint32_t badIcCount =
-  0;
+// Show performed because both lines were ready.
+static uint32_t fullSyncShows = 0;
 
-static uint32_t badLine =
-  0;
 
-static uint32_t badCRC =
-  0;
+// Show performed because timeout expired.
+static uint32_t timeoutShows = 0;
+
+
+static uint32_t badMagic = 0;
+static uint32_t badVersion = 0;
+static uint32_t badIcCount = 0;
+static uint32_t badLine = 0;
+static uint32_t badCRC = 0;
 
 
 // ======================================================
-// SEQUENCE STATS - PER LINE
+// SEQUENCE
 // ======================================================
 
 static uint32_t lastFrameId[2] =
@@ -201,8 +198,7 @@ static uint32_t outOfOrderFrames[2] =
 // DEBUG
 // ======================================================
 
-static uint32_t lastStatusMillis =
-  0;
+static uint32_t lastStatusMillis = 0;
 
 
 // ======================================================
@@ -214,8 +210,7 @@ static uint16_t calculateCRC16(
   size_t length
 )
 {
-  uint16_t crc =
-    0xFFFF;
+  uint16_t crc = 0xFFFF;
 
 
   for (
@@ -234,9 +229,7 @@ static uint16_t calculateCRC16(
       bit++
     )
     {
-      if (
-        crc & 0x8000
-      )
+      if (crc & 0x8000)
       {
         crc =
           (crc << 1) ^
@@ -318,19 +311,11 @@ static void onEspNowReceive(
 
 
 // ======================================================
-// CREATE RX QUEUE
+// CREATE QUEUE
 // ======================================================
 
 static bool createRxQueue()
 {
-  if (
-    rxQueue != nullptr
-  )
-  {
-    return true;
-  }
-
-
   rxQueue =
     xQueueCreate(
       RX_QUEUE_LENGTH,
@@ -365,9 +350,7 @@ static bool createRxQueue()
 
 static bool startEspNow()
 {
-  if (
-    espNowReady
-  )
+  if (espNowReady)
   {
     return true;
   }
@@ -389,9 +372,7 @@ static bool startEspNow()
   );
 
 
-  uint8_t channel =
-    0;
-
+  uint8_t channel = 0;
 
   wifi_second_chan_t secondary =
     WIFI_SECOND_CHAN_NONE;
@@ -453,17 +434,15 @@ static bool startEspNow()
 
     esp_now_deinit();
 
-
     return false;
   }
 
 
-  espNowReady =
-    true;
+  espNowReady = true;
 
 
   Serial.println(
-    "ESP-NOW DUAL RECEIVER READY"
+    "ESP-NOW DUAL RX V2 READY"
   );
 
 
@@ -472,7 +451,7 @@ static bool startEspNow()
 
 
 // ======================================================
-// FRAME SEQUENCE
+// SEQUENCE
 // ======================================================
 
 static void processSequence(
@@ -548,10 +527,6 @@ static void processPacket(
     item.packet;
 
 
-  // ----------------------------------------------------
-  // MAGIC
-  // ----------------------------------------------------
-
   if (
     packet.magic !=
     PACKET_MAGIC
@@ -562,10 +537,6 @@ static void processPacket(
     return;
   }
 
-
-  // ----------------------------------------------------
-  // VERSION
-  // ----------------------------------------------------
 
   if (
     packet.version !=
@@ -578,10 +549,6 @@ static void processPacket(
   }
 
 
-  // ----------------------------------------------------
-  // LINE
-  // ----------------------------------------------------
-
   if (
     packet.lineId > 1
   )
@@ -591,10 +558,6 @@ static void processPacket(
     return;
   }
 
-
-  // ----------------------------------------------------
-  // IC COUNT
-  // ----------------------------------------------------
 
   if (
     packet.icCount !=
@@ -607,20 +570,16 @@ static void processPacket(
   }
 
 
-  // ----------------------------------------------------
-  // CRC
-  // ----------------------------------------------------
-
-  uint16_t crc =
+  uint16_t calculatedCRC =
     calculateCRC16(
       (const uint8_t *)&packet,
-      sizeof(LedPacket) -
+      sizeof(packet) -
       sizeof(packet.crc)
     );
 
 
   if (
-    crc !=
+    calculatedCRC !=
     packet.crc
   )
   {
@@ -629,10 +588,6 @@ static void processPacket(
     return;
   }
 
-
-  // ====================================================
-  // GOOD FRAME
-  // ====================================================
 
   uint8_t lineId =
     packet.lineId;
@@ -654,12 +609,31 @@ static void processPacket(
   );
 
 
-  lineFrameReady[lineId] =
-    true;
+  lineReady[lineId] = true;
+
+
+  uint32_t now =
+    millis();
+
+
+  lineReceivedMs[lineId] =
+    now;
 
 
   lastPacketMillis =
-    millis();
+    now;
+
+
+  // First line entering a new sync pair.
+  if (
+    !lineReady[
+      lineId == 0 ? 1 : 0
+    ]
+  )
+  {
+    syncWindowStartMs =
+      now;
+  }
 }
 
 
@@ -696,26 +670,13 @@ static void processRxQueue()
 
 
 // ======================================================
-// APPLY ONE LINE TO WLED
+// COPY ONE LINE INTO WLED BUFFER
 // ======================================================
 
-static void applyLineToWLED(
+static void copyLineToWLED(
   uint8_t lineId
 )
 {
-  if (
-    !lineFrameReady[lineId]
-  )
-  {
-    return;
-  }
-
-
-  // ----------------------------------------------------
-  // line 0 starts at WLED pixel 0
-  // line 1 starts at WLED pixel 38
-  // ----------------------------------------------------
-
   uint16_t pixelOffset =
     lineId *
     ICS_PER_LINE;
@@ -731,10 +692,7 @@ static void applyLineToWLED(
       i * 3;
 
 
-    // Incoming:
-    // byte 0 = G
-    // byte 1 = R
-    // byte 2 = B
+    // Incoming packet = G R B
 
     uint8_t inputG =
       lineFrame[lineId][
@@ -754,9 +712,8 @@ static void applyLineToWLED(
       ];
 
 
-    // Logical RGB to WLED.
-    //
-    // WLED itself handles physical BRG ordering.
+    // Logical RGB.
+    // WLED Color Order remains BRG.
 
     strip.setPixelColor(
       pixelOffset + i,
@@ -767,23 +724,52 @@ static void applyLineToWLED(
   }
 
 
-  lineFrameReady[lineId] =
-    false;
-
-
   framesShown[lineId]++;
 }
 
 
 // ======================================================
-// APPLY READY FRAMES
+// SYNCHRONIZED OUTPUT
 // ======================================================
 
-static void applyFramesToWLED()
+static void updateSynchronizedOutput()
 {
   if (
-    !lineFrameReady[0] &&
-    !lineFrameReady[1]
+    !lineReady[0] &&
+    !lineReady[1]
+  )
+  {
+    return;
+  }
+
+
+  uint32_t now =
+    millis();
+
+
+  bool bothReady =
+    lineReady[0] &&
+    lineReady[1];
+
+
+  bool syncTimeout =
+    (
+      syncWindowStartMs != 0 &&
+      now -
+      syncWindowStartMs >=
+      LINE_SYNC_TIMEOUT_MS
+    );
+
+
+  // Wait until:
+  //
+  // 1) BOTH lines are ready
+  // OR
+  // 2) 50 ms passed waiting for the other line.
+
+  if (
+    !bothReady &&
+    !syncTimeout
   )
   {
     return;
@@ -800,24 +786,68 @@ static void applyFramesToWLED()
     true;
 
 
-  // Update whichever line has a new frame.
-  applyLineToWLED(
-    0
-  );
+  // ----------------------------------------------------
+  // IMPORTANT:
+  //
+  // Update BOTH WLED buffers first.
+  // Then strip.show() only once.
+  // ----------------------------------------------------
+
+  if (
+    lineReady[0]
+  )
+  {
+    copyLineToWLED(
+      0
+    );
+  }
 
 
-  applyLineToWLED(
-    1
-  );
+  if (
+    lineReady[1]
+  )
+  {
+    copyLineToWLED(
+      1
+    );
+  }
 
 
-  // Send both configured WLED buses.
   strip.show();
+
+
+  synchronizedShows++;
+
+
+  if (bothReady)
+  {
+    fullSyncShows++;
+  }
+  else
+  {
+    timeoutShows++;
+  }
+
+
+  // Both pending states are now consumed.
+  //
+  // If one wasn't ready, its previous displayed frame
+  // simply remains on the strip.
+
+  lineReady[0] =
+    false;
+
+  lineReady[1] =
+    false;
+
+
+  syncWindowStartMs =
+    0;
 }
 
 
 // ======================================================
-// SIGNAL TIMEOUT
+// REALTIME TIMEOUT
 // ======================================================
 
 static void updateRealtimeTimeout()
@@ -840,18 +870,22 @@ static void updateRealtimeTimeout()
       false;
 
 
-    lineFrameReady[0] =
+    lineReady[0] =
       false;
 
-    lineFrameReady[1] =
+    lineReady[1] =
       false;
+
+
+    syncWindowStartMs =
+      0;
 
 
     exitRealtime();
 
 
     Serial.println(
-      "ESP-NOW signal lost -> WLED resumed"
+      "ESP-NOW stopped >10 sec -> WLED resumed"
     );
   }
 }
@@ -875,7 +909,7 @@ static void printStatus()
   );
 
   Serial.print(
-    " Shown="
+    " Applied="
   );
 
   Serial.print(
@@ -900,7 +934,7 @@ static void printStatus()
   );
 
   Serial.print(
-    " Shown="
+    " Applied="
   );
 
   Serial.print(
@@ -917,7 +951,34 @@ static void printStatus()
 
 
   Serial.print(
-    "Total RX="
+    "Shows="
+  );
+
+  Serial.print(
+    synchronizedShows
+  );
+
+
+  Serial.print(
+    " FullSync="
+  );
+
+  Serial.print(
+    fullSyncShows
+  );
+
+
+  Serial.print(
+    " TimeoutShow="
+  );
+
+  Serial.println(
+    timeoutShows
+  );
+
+
+  Serial.print(
+    "TotalRX="
   );
 
   Serial.print(
@@ -958,6 +1019,28 @@ static void printStatus()
 
   Serial.println(
     queueDrops
+  );
+
+
+  Serial.print(
+    "Pending: L0="
+  );
+
+  Serial.print(
+    lineReady[0] ?
+    "YES" :
+    "NO"
+  );
+
+
+  Serial.print(
+    " L1="
+  );
+
+  Serial.println(
+    lineReady[1] ?
+    "YES" :
+    "NO"
   );
 
 
@@ -1027,7 +1110,7 @@ static void printStatus()
 // USERMOD
 // ======================================================
 
-class DualEspNowLedReceiver :
+class DualEspNowSyncReceiver :
   public Usermod
 {
 
@@ -1050,12 +1133,12 @@ public:
 
 
     Serial.println(
-      "WLED DUAL ESP-NOW LED RX V1"
+      "WLED DUAL ESP-NOW LED RX V2"
     );
 
 
     Serial.println(
-      "WLED 16.0.0 / ESP32 Classic"
+      "SYNCHRONIZED OUTPUT"
     );
 
 
@@ -1065,12 +1148,12 @@ public:
 
 
     Serial.println(
-      "lineId 0 -> pixels 0..37 -> GPIO16"
+      "lineId 0 -> GPIO16 / pixels 0..37"
     );
 
 
     Serial.println(
-      "lineId 1 -> pixels 38..75 -> GPIO2"
+      "lineId 1 -> GPIO2 / pixels 38..75"
     );
 
 
@@ -1080,7 +1163,7 @@ public:
 
 
     Serial.println(
-      "Incoming order = GRB"
+      "Incoming = GRB"
     );
 
 
@@ -1089,23 +1172,38 @@ public:
     );
 
 
+    Serial.print(
+      "Sync wait = "
+    );
+
+    Serial.print(
+      LINE_SYNC_TIMEOUT_MS
+    );
+
     Serial.println(
-      "Packet version = 2"
+      " ms"
     );
 
 
     Serial.print(
-      "Expected packet bytes = "
+      "Signal timeout = "
     );
 
+    Serial.print(
+      SIGNAL_TIMEOUT_MS
+    );
+
+    Serial.println(
+      " ms"
+    );
+
+
+    Serial.print(
+      "Packet bytes = "
+    );
 
     Serial.println(
       sizeof(LedPacket)
-    );
-
-
-    Serial.println(
-      "ESP-NOW: WAIT FOR WIFI"
     );
 
 
@@ -1129,9 +1227,9 @@ public:
       millis();
 
 
-    // --------------------------------------------------
-    // Start ESP-NOW only after WLED Wi-Fi.
-    // --------------------------------------------------
+    // ==================================================
+    // ESP-NOW after WLED Wi-Fi
+    // ==================================================
 
     if (
       !espNowReady &&
@@ -1155,9 +1253,9 @@ public:
     }
 
 
-    // --------------------------------------------------
-    // RX
-    // --------------------------------------------------
+    // ==================================================
+    // RECEIVE + SYNCHRONIZED OUTPUT
+    // ==================================================
 
     if (
       espNowReady
@@ -1165,16 +1263,17 @@ public:
     {
       processRxQueue();
 
-      applyFramesToWLED();
+
+      updateSynchronizedOutput();
     }
 
 
     updateRealtimeTimeout();
 
 
-    // --------------------------------------------------
+    // ==================================================
     // STATUS
-    // --------------------------------------------------
+    // ==================================================
 
     if (
       now -
@@ -1198,7 +1297,7 @@ public:
     JsonObject info =
       root["u"]
       .createNestedObject(
-        "Dual ESP-NOW RX"
+        "Dual Sync ESP-NOW RX"
       );
 
 
@@ -1206,28 +1305,24 @@ public:
       espNowReady;
 
 
-    info["line0_rx"] =
+    info["l0_rx"] =
       packetsGood[0];
 
 
-    info["line1_rx"] =
+    info["l1_rx"] =
       packetsGood[1];
 
 
-    info["line0_shown"] =
-      framesShown[0];
+    info["shows"] =
+      synchronizedShows;
 
 
-    info["line1_shown"] =
-      framesShown[1];
+    info["full_sync"] =
+      fullSyncShows;
 
 
-    info["line0_lost"] =
-      lostFrames[0];
-
-
-    info["line1_lost"] =
-      lostFrames[1];
+    info["timeout_show"] =
+      timeoutShows;
 
 
     info["crc_bad"] =
@@ -1245,7 +1340,7 @@ public:
 
   uint16_t getId() override
   {
-    return 0x5060;
+    return 0x5061;
   }
 };
 
@@ -1254,10 +1349,10 @@ public:
 // REGISTER
 // ======================================================
 
-static DualEspNowLedReceiver
-dualEspNowLedReceiver;
+static DualEspNowSyncReceiver
+dualEspNowSyncReceiver;
 
 
 REGISTER_USERMOD(
-  dualEspNowLedReceiver
+  dualEspNowSyncReceiver
 );
